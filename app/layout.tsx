@@ -1,9 +1,11 @@
 import type { Metadata, Viewport } from "next";
+import "leaflet/dist/leaflet.css";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "GeoClock Web",
-  description: "到站提醒與家人協助叫醒網頁版"
+  description: "到站提醒與家人協助叫醒網頁版",
+  manifest: "/manifest.webmanifest"
 };
 
 export const viewport: Viewport = {
@@ -11,7 +13,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   viewportFit: "cover",
-  themeColor: "#0b0f14"
+  themeColor: "#0a0a0a"
 };
 
 export default function RootLayout({

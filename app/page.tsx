@@ -1,18 +1,22 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   destinationKey,
   formatDistance,
+  getApproximateLocation,
   getLocationHealth,
   getTripStatus,
   haversineDistanceMeters,
   normalizeDestinationIdentity,
   parseGoogleMapsCoordinates
 } from "@/lib/geo";
-import { clearGeoClockStorage, loadSnapshot, STORAGE_KEYS, writeStored } from "@/lib/storage";
+import { clearGeoClockStorage, DEFAULT_PRIVACY_SETTINGS, DEFAULT_TRIP_SETTINGS, loadSnapshot, STORAGE_KEYS, writeStored } from "@/lib/storage";
+import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
 import type {
   ActiveTrip,
+  CloudTripRow,
   CurrentPosition,
   Destination,
   EventRecord,
@@ -20,9 +24,16 @@ import type {
   FamilyMember,
   FamilyPermission,
   LocationHealth,
+  PlaceSearchCandidate,
+  PrivacySettings,
   TripStatus,
-  UserProfile
+  UserProfile,
+  WakeRequestRow
 } from "@/lib/types";
+
+const TripMap = dynamic(() => import("@/components/TripMap"), {
+  ssr: false
+});
 
 const RADIUS_OPTIONS = [
   { label: "300 m", value: 300 },
@@ -31,6 +42,10 @@ const RADIUS_OPTIONS = [
   { label: "2 km", value: 2000 }
 ];
 
+const ARRIVAL_RADIUS_OPTIONS = [50, 100, 200, 300];
+const DEFAULT_ARRIVAL_RADIUS_METERS = 100;
+const MIN_ALERT_RADIUS_METERS = 50;
+const MAX_ALERT_RADIUS_METERS = 10000;
 const MILESTONE_METERS = [5000, 2000, 1000, 500, 300];
 const PERMISSIONS: FamilyPermission[] = ["只看狀態", "可看位置", "可叫醒我"];
 
@@ -80,6 +95,25 @@ type DestinationFormState = {
   mapsUrl: string;
   manualLat: string;
   manualLng: string;
+  locationSource: "none" | "geoapify" | "manual";
+};
+
+type PlaceSearchState = {
+  status: "idle" | "loading" | "success" | "empty" | "error";
+  message: string;
+};
+
+type CloudShareState = {
+  status: "idle" | "creating" | "active" | "error";
+  message: string;
+  tripId?: string;
+  shareCode?: string;
+  shareUrl?: string;
+};
+
+type NotificationState = {
+  status: "尚未啟用" | "已啟用" | "被拒絕" | "此瀏覽器不支援";
+  message: string;
 };
 
 const emptyDestinationForm: DestinationFormState = {
@@ -87,7 +121,8 @@ const emptyDestinationForm: DestinationFormState = {
   address: "",
   mapsUrl: "",
   manualLat: "",
-  manualLng: ""
+  manualLng: "",
+  locationSource: "none"
 };
 
 export default function Home() {
@@ -98,19 +133,40 @@ export default function Home() {
   const [destinationForm, setDestinationForm] = useState<DestinationFormState>(emptyDestinationForm);
   const [destinationNotice, setDestinationNotice] = useState<string | null>(null);
   const [advancedDestinationOpen, setAdvancedDestinationOpen] = useState(false);
+  const [placeSearchState, setPlaceSearchState] = useState<PlaceSearchState>({
+    status: "idle",
+    message: ""
+  });
+  const [placeCandidates, setPlaceCandidates] = useState<PlaceSearchCandidate[]>([]);
   const [selectedDestinationId, setSelectedDestinationId] = useState("");
-  const [radiusMeters, setRadiusMeters] = useState(500);
+  const [radiusMeters, setRadiusMeters] = useState(DEFAULT_TRIP_SETTINGS.alertRadiusMeters);
+  const [customRadiusInput, setCustomRadiusInput] = useState("");
+  const [radiusNotice, setRadiusNotice] = useState("");
+  const [arrivalRadiusMeters, setArrivalRadiusMeters] = useState(DEFAULT_TRIP_SETTINGS.arrivalRadiusMeters);
   const [activeTrip, setActiveTrip] = useState<ActiveTrip | null>(null);
   const [family, setFamily] = useState<FamilyMember[]>([]);
   const [familyCode, setFamilyCode] = useState("");
   const [familyPermission, setFamilyPermission] = useState<FamilyPermission>("只看狀態");
+  const [privacySettings, setPrivacySettings] = useState<PrivacySettings>(DEFAULT_PRIVACY_SETTINGS);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [wakeLockStatus, setWakeLockStatus] = useState("尚未啟用");
   const [audioStatus, setAudioStatus] = useState("提醒音尚未啟用");
   const [strongAlert, setStrongAlert] = useState<string | null>(null);
+  const [cloudShare, setCloudShare] = useState<CloudShareState>({
+    status: "idle",
+    message: ""
+  });
+  const [notificationState, setNotificationState] = useState<NotificationState>({
+    status: "尚未啟用",
+    message: "通知功能需將網站加入 iPhone 主畫面後使用。"
+  });
+  const [activeWakeRequest, setActiveWakeRequest] = useState<WakeRequestRow | null>(null);
+  const [wakeToneActive, setWakeToneActive] = useState(false);
+  const [eventsExpanded, setEventsExpanded] = useState(false);
   const [preflightOpen, setPreflightOpen] = useState(false);
   const [preflightDestination, setPreflightDestination] = useState<Destination | null>(null);
   const [preflightRadiusMeters, setPreflightRadiusMeters] = useState(500);
+  const [preflightArrivalRadiusMeters, setPreflightArrivalRadiusMeters] = useState(DEFAULT_ARRIVAL_RADIUS_METERS);
   const [locationCheck, setLocationCheck] = useState<LocationCheckState>(initialLocationCheck);
   const [audioCheck, setAudioCheck] = useState<PreflightCheckState>(initialAudioCheck);
   const [vibrationCheck, setVibrationCheck] = useState<PreflightCheckState>(initialVibrationCheck);
@@ -122,6 +178,12 @@ export default function Home() {
   const milestoneRef = useRef<Set<number>>(new Set());
   const eventGateRef = useRef<Set<EventType>>(new Set());
   const tripStartedRef = useRef(false);
+  const cloudShareRef = useRef<CloudShareState>({
+    status: "idle",
+    message: ""
+  });
+  const wakeToneIntervalRef = useRef<number | null>(null);
+  const wakeToneTimeoutRef = useRef<number | null>(null);
 
   const selectedDestination = useMemo(
     () => destinations.find((destination) => destination.id === selectedDestinationId) ?? null,
@@ -138,6 +200,11 @@ export default function Home() {
     () => parseManualLocation(destinationForm.manualLat, destinationForm.manualLng),
     [destinationForm.manualLat, destinationForm.manualLng]
   );
+  const mapDestination = activeTrip?.destination ?? selectedDestination;
+  const mapPosition = activeTrip?.lastPosition;
+  const mapRadiusMeters = activeTrip?.radiusMeters ?? radiusMeters;
+  const displayArrivalRadiusMeters = activeTrip?.arrivalRadiusMeters ?? arrivalRadiusMeters;
+  const approximateLocationPreview = mapPosition ? getApproximateLocation(mapPosition.lat, mapPosition.lng) : null;
   const preflightChecksAttempted =
     locationCheck.status !== "尚未測試" &&
     audioCheck.status !== "尚未測試" &&
@@ -151,9 +218,38 @@ export default function Home() {
     setDestinations(snapshot.destinations);
     setFamily(snapshot.family);
     setEvents(snapshot.events);
+    setPrivacySettings(snapshot.privacy);
+    setRadiusMeters(snapshot.tripSettings.alertRadiusMeters);
+    setArrivalRadiusMeters(getSafeArrivalRadius(snapshot.tripSettings.arrivalRadiusMeters, snapshot.tripSettings.alertRadiusMeters));
     setSelectedDestinationId(snapshot.destinations[0]?.id ?? "");
     setHydrated(true);
   }, []);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+
+    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setNotificationState({
+        status: "此瀏覽器不支援",
+        message: "此瀏覽器不支援 Web Push。iPhone 請確認已加入主畫面並從主畫面開啟。"
+      });
+      return;
+    }
+
+    if (Notification.permission === "granted") {
+      setNotificationState({
+        status: "已啟用",
+        message: "通知已允許。"
+      });
+    } else if (Notification.permission === "denied") {
+      setNotificationState({
+        status: "被拒絕",
+        message: "通知權限被拒絕，請到 Safari 網站設定中允許通知。"
+      });
+    }
+  }, [hydrated]);
 
   useEffect(() => {
     if (!hydrated) {
@@ -181,13 +277,32 @@ export default function Home() {
   }, [hydrated, events]);
 
   useEffect(() => {
+    if (hydrated) {
+      writeStored(STORAGE_KEYS.privacy, privacySettings);
+    }
+  }, [hydrated, privacySettings]);
+
+  useEffect(() => {
+    if (hydrated) {
+      writeStored(STORAGE_KEYS.tripSettings, {
+        alertRadiusMeters: radiusMeters,
+        arrivalRadiusMeters
+      });
+    }
+  }, [hydrated, radiusMeters, arrivalRadiusMeters]);
+
+  useEffect(() => {
+    cloudShareRef.current = cloudShare;
+  }, [cloudShare]);
+
+  useEffect(() => {
     if (!activeTrip) {
       return;
     }
 
     const interval = window.setInterval(() => {
       const health = getLocationHealth(activeTrip.lastPosition?.updatedAt);
-      const status = getTripStatus(activeTrip.distanceMeters, activeTrip.radiusMeters, health);
+      const status = getTripStatus(activeTrip.distanceMeters, activeTrip.radiusMeters, activeTrip.arrivalRadiusMeters, health);
       logStatusTransition(status, activeTrip.health, health);
       setActiveTrip((trip) => (trip ? { ...trip, health, status } : trip));
     }, 5000);
@@ -199,8 +314,47 @@ export default function Home() {
     return () => {
       stopGeolocationWatch();
       releaseWakeLock();
+      stopWakeTone();
     };
   }, []);
+
+  useEffect(() => {
+    if (!user || !isSupabaseConfigured || !supabase) {
+      return;
+    }
+
+    const supabaseClient = supabase;
+    const ownerCode = user.code;
+    let disposed = false;
+    async function pollWakeRequests() {
+      const { data } = await supabaseClient
+        .from("wake_requests")
+        .select("*")
+        .eq("to_owner_code", ownerCode)
+        .eq("status", "active")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (disposed) {
+        return;
+      }
+
+      if (data) {
+        setActiveWakeRequest(data as WakeRequestRow);
+        setStrongAlert("家人正在呼叫你。請確認目前位置與下車狀態。");
+        startWakeTone();
+        appendStatusEventOnce("收到家人呼叫", "收到家人呼叫提醒");
+      }
+    }
+
+    void pollWakeRequests();
+    const interval = window.setInterval(pollWakeRequests, 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [user]);
 
   function createEvent(type: EventType, message: string): EventRecord {
     return {
@@ -228,10 +382,10 @@ export default function Home() {
       appendStatusEventOnce("接近目的地", "距離目的地已小於 5 km");
     }
     if (status === "快到目的地") {
-      appendStatusEventOnce("快到目的地", "已低於提醒半徑");
+      appendStatusEventOnce("快到目的地", "已進入快到提醒距離");
     }
     if (status === "已抵達") {
-      appendStatusEventOnce("已抵達", "距離目的地小於 100 m");
+      appendStatusEventOnce("已抵達", "已進入已抵達判斷距離");
     }
     if (previousHealth !== "延遲" && health === "延遲") {
       appendStatusEventOnce("定位延遲", "最後定位更新已超過 20 秒");
@@ -299,7 +453,7 @@ export default function Home() {
           : "這個連結暫時無法取得目的地定位，請確認是否為 Google Maps 分享連結。"
       );
     }
-    if (manualResult.status === "valid") {
+    if (manualResult.status === "valid" && destinationForm.locationSource === "manual") {
       appendEvent("手動輸入定位資料成功", `${name} 已使用進階輸入取得目的地定位`);
     }
 
@@ -354,6 +508,65 @@ export default function Home() {
       return sortDestinations([nextDestination, ...current]);
     });
     setDestinationForm(emptyDestinationForm);
+    setPlaceCandidates([]);
+    setPlaceSearchState({ status: "idle", message: "" });
+  }
+
+  async function searchPlaces() {
+    const query = destinationForm.address.trim() || destinationForm.name.trim();
+    if (!query) {
+      setPlaceSearchState({ status: "error", message: "請先輸入地址或地點。" });
+      return;
+    }
+
+    setPlaceSearchState({ status: "loading", message: "搜尋中..." });
+    setPlaceCandidates([]);
+
+    try {
+      const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+      const payload = (await response.json()) as {
+        results?: PlaceSearchCandidate[];
+        message?: string;
+      };
+
+      if (!response.ok) {
+        setPlaceSearchState({
+          status: "error",
+          message: payload.message ?? "地點搜尋暫時無法使用，請稍後再試，或貼 Google Maps 分享連結。"
+        });
+        return;
+      }
+
+      const results = payload.results ?? [];
+      if (results.length === 0) {
+        setPlaceSearchState({
+          status: "empty",
+          message: "找不到目的地定位，請換更完整的地點名稱或貼 Google Maps 分享連結。"
+        });
+        return;
+      }
+
+      setPlaceCandidates(results);
+      setPlaceSearchState({ status: "success", message: "請選擇最接近的地點。" });
+    } catch {
+      setPlaceSearchState({
+        status: "error",
+        message: "地點搜尋暫時無法使用，請稍後再試，或貼 Google Maps 分享連結。"
+      });
+    }
+  }
+
+  function selectPlaceCandidate(candidate: PlaceSearchCandidate) {
+    setDestinationForm((form) => ({
+      ...form,
+      name: form.name.trim() ? form.name : candidate.label,
+      address: candidate.address,
+      manualLat: String(candidate.lat),
+      manualLng: String(candidate.lng),
+      locationSource: "geoapify"
+    }));
+    setDestinationNotice("已取得目的地定位");
+    setPlaceSearchState({ status: "success", message: "已取得目的地定位" });
   }
 
   function selectDestination(destination: Destination) {
@@ -363,8 +576,11 @@ export default function Home() {
       address: destination.address,
       mapsUrl: destination.mapsUrl ?? "",
       manualLat: "",
-      manualLng: ""
+      manualLng: "",
+      locationSource: "none"
     });
+    setPlaceCandidates([]);
+    setPlaceSearchState({ status: "idle", message: "" });
     setDestinations((current) =>
       sortDestinations(
         current.map((item) => (item.id === destination.id ? { ...item, lastUsedAt: new Date().toISOString() } : item))
@@ -389,13 +605,54 @@ export default function Home() {
       appendEvent("嘗試開始沒有定位資料的行程", selectedDestination ? `${selectedDestination.name} 尚未取得定位資料` : "尚未選擇目的地");
       return;
     }
+    const safeArrivalRadius = getSafeArrivalRadius(arrivalRadiusMeters, radiusMeters);
     stopGeolocationWatch();
     resetPreflightChecks();
     setPreflightDestination(selectedDestination);
     setPreflightRadiusMeters(radiusMeters);
+    setPreflightArrivalRadiusMeters(safeArrivalRadius);
     setPreflightOpen(true);
     setStrongAlert(null);
     appendEvent("進入啟動前檢查", `準備前往 ${selectedDestination.name}`);
+  }
+
+  function chooseAlertRadius(value: number) {
+    setRadiusMeters(value);
+    setCustomRadiusInput("");
+    if (arrivalRadiusMeters > value) {
+      setArrivalRadiusMeters(value);
+      setRadiusNotice(`已抵達判斷距離已調整為 ${formatDistance(value)}，避免大於快到提醒距離。`);
+      return;
+    }
+    setRadiusNotice("");
+  }
+
+  function applyCustomAlertRadius() {
+    const parsed = Number(customRadiusInput.trim());
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+      setRadiusNotice("請輸入有效的公尺數，例如 750。");
+      return;
+    }
+    if (parsed < MIN_ALERT_RADIUS_METERS || parsed > MAX_ALERT_RADIUS_METERS) {
+      setRadiusNotice("自訂提醒距離需介於 50 m 到 10000 m。");
+      return;
+    }
+
+    setRadiusMeters(parsed);
+    if (arrivalRadiusMeters > parsed) {
+      setArrivalRadiusMeters(parsed);
+      setRadiusNotice(`快到提醒距離已設定為 ${formatDistance(parsed)}，已抵達判斷距離已同步調整。`);
+      return;
+    }
+    setRadiusNotice(`快到提醒距離已設定為 ${formatDistance(parsed)}。`);
+  }
+
+  function chooseArrivalRadius(value: number) {
+    const safeValue = getSafeArrivalRadius(value, radiusMeters);
+    setArrivalRadiusMeters(safeValue);
+    setRadiusNotice(
+      safeValue === value ? "" : `已抵達判斷距離不可大於快到提醒距離，已調整為 ${formatDistance(safeValue)}。`
+    );
   }
 
   function resetPreflightChecks() {
@@ -505,16 +762,22 @@ export default function Home() {
     eventGateRef.current = new Set();
     tripStartedRef.current = false;
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
-    appendEvent("正式開始旅程", `前往 ${preflightDestination.name}，提醒半徑 ${formatDistance(preflightRadiusMeters)}`);
+    appendEvent(
+      "正式開始旅程",
+      `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}`
+    );
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         if (!tripStartedRef.current) {
           tripStartedRef.current = true;
           setPreflightOpen(false);
           setStrongAlert(null);
-          appendEvent("開始行程", `前往 ${preflightDestination.name}，提醒半徑 ${formatDistance(preflightRadiusMeters)}`);
+          appendEvent(
+            "開始行程",
+            `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}`
+          );
         }
-        handlePositionUpdate(position, preflightDestination, preflightRadiusMeters);
+        handlePositionUpdate(position, preflightDestination, preflightRadiusMeters, preflightArrivalRadiusMeters);
       },
       (error) => {
         const message = getGeolocationFailureMessage(error);
@@ -535,7 +798,7 @@ export default function Home() {
     );
   }
 
-  function handlePositionUpdate(position: GeolocationPosition, destination: Destination, tripRadius: number) {
+  function handlePositionUpdate(position: GeolocationPosition, destination: Destination, tripRadius: number, tripArrivalRadius: number) {
     if (typeof destination.lat !== "number" || typeof destination.lng !== "number") {
       return;
     }
@@ -548,7 +811,7 @@ export default function Home() {
     };
     const distanceMeters = haversineDistanceMeters(nextPosition, { lat: destination.lat, lng: destination.lng });
     const health = getLocationHealth(nextPosition.updatedAt);
-    const status = getTripStatus(distanceMeters, tripRadius, health);
+    const status = getTripStatus(distanceMeters, tripRadius, tripArrivalRadius, health);
 
     logStatusTransition(status, activeTrip?.health ?? "正常", health);
     setActiveTrip((trip) => {
@@ -557,6 +820,7 @@ export default function Home() {
         ({
           destination,
           radiusMeters: tripRadius,
+          arrivalRadiusMeters: tripArrivalRadius,
           startedAt: new Date().toISOString(),
           status: "行程中",
           health: "正常"
@@ -571,10 +835,19 @@ export default function Home() {
     });
 
     appendEvent("定位更新", `距離 ${destination.name} ${formatDistance(distanceMeters)}`);
-    triggerMilestones(distanceMeters, tripRadius);
+    void syncCloudTrip({
+      destination,
+      distanceMeters,
+      health,
+      position: nextPosition,
+      radiusMeters: tripRadius,
+      arrivalRadiusMeters: tripArrivalRadius,
+      status
+    });
+    triggerMilestones(distanceMeters, tripRadius, tripArrivalRadius);
   }
 
-  function triggerMilestones(distanceMeters: number, tripRadius: number) {
+  function triggerMilestones(distanceMeters: number, tripRadius: number, tripArrivalRadius: number) {
     for (const milestone of MILESTONE_METERS) {
       if (distanceMeters <= milestone && !milestoneRef.current.has(milestone)) {
         milestoneRef.current.add(milestone);
@@ -583,8 +856,17 @@ export default function Home() {
       }
     }
 
-    if (distanceMeters <= tripRadius) {
+    const alertKey = 100000 + tripRadius;
+    if (distanceMeters <= tripRadius && !milestoneRef.current.has(alertKey)) {
+      milestoneRef.current.add(alertKey);
       setStrongAlert("快到目的地，請準備下車。");
+      playAlert();
+    }
+
+    const arrivalKey = 200000 + tripArrivalRadius;
+    if (distanceMeters <= tripArrivalRadius && !milestoneRef.current.has(arrivalKey)) {
+      milestoneRef.current.add(arrivalKey);
+      setStrongAlert("已抵達目的地附近，請確認下車。");
       playAlert();
     }
   }
@@ -594,6 +876,7 @@ export default function Home() {
     releaseWakeLock();
     if (activeTrip) {
       appendEvent("停止行程", `${activeTrip.destination.name} 的行程已停止`);
+      void endCloudTrip(activeTrip.status);
     }
     setActiveTrip(null);
     setStrongAlert(null);
@@ -601,6 +884,313 @@ export default function Home() {
     setPreflightOpen(false);
     setPreflightDestination(null);
     tripStartedRef.current = false;
+    setCloudShare((current) =>
+      current.status === "active" ? { ...current, status: "idle", message: "共享行程已停止" } : current
+    );
+  }
+
+  async function enableCloudSharing() {
+    if (!activeTrip || !user) {
+      return;
+    }
+    if (!isSupabaseConfigured || !supabase) {
+      setCloudShare({
+        status: "error",
+        message: "尚未設定 Supabase，請先設定環境變數後再開啟共享。"
+      });
+      return;
+    }
+
+    setCloudShare({ status: "creating", message: "正在建立分享連結..." });
+
+    const shareCode = createShareCode();
+    const shareUrl = `${window.location.origin}/share/${shareCode}`;
+    const approximate = activeTrip.lastPosition ? getApproximateLocation(activeTrip.lastPosition.lat, activeTrip.lastPosition.lng) : null;
+
+    try {
+      await supabase.from("users").upsert(
+        {
+          display_name: user.nickname,
+          user_code: user.code
+        },
+        { ignoreDuplicates: true, onConflict: "user_code" }
+      );
+
+      const { data, error } = await supabase
+        .from("trips")
+        .insert({
+          share_code: shareCode,
+          owner_code: user.code,
+          destination_name: activeTrip.destination.name,
+          destination_address: activeTrip.destination.address,
+          destination_lat: activeTrip.destination.lat as number,
+          destination_lng: activeTrip.destination.lng as number,
+          alert_radius_m: activeTrip.radiusMeters,
+          arrival_radius_m: activeTrip.arrivalRadiusMeters,
+          status: activeTrip.status,
+          distance_m: activeTrip.distanceMeters ?? null,
+          current_lat: activeTrip.lastPosition?.lat ?? null,
+          current_lng: activeTrip.lastPosition?.lng ?? null,
+          approximate_lat: approximate?.lat ?? null,
+          approximate_lng: approximate?.lng ?? null,
+          last_location_at: activeTrip.lastPosition?.updatedAt ?? null
+        })
+        .select("id, share_code")
+        .single();
+
+      if (error || !data) {
+        throw error ?? new Error("Missing trip row");
+      }
+
+      setCloudShare({
+        status: "active",
+        message: "家人共享已開啟",
+        tripId: data.id,
+        shareCode: data.share_code,
+        shareUrl
+      });
+      appendEvent("開啟家人共享", `分享連結已建立：${shareUrl}`);
+    } catch {
+      setCloudShare({
+        status: "error",
+        message: "雲端共享建立失敗，本機行程仍會繼續。請確認 Supabase 設定與 SQL 權限。"
+      });
+      appendEvent("雲端行程同步失敗", "建立分享連結失敗");
+    }
+  }
+
+  async function copyShareLink() {
+    if (!cloudShare.shareUrl) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(cloudShare.shareUrl);
+      setCloudShare((current) => ({ ...current, message: "分享連結已複製" }));
+    } catch {
+      setCloudShare((current) => ({ ...current, message: "無法自動複製，請手動複製分享連結。" }));
+    }
+  }
+
+  async function syncCloudTrip({
+    destination,
+    distanceMeters,
+    position,
+    radiusMeters,
+    arrivalRadiusMeters,
+    status
+  }: {
+    destination: Destination;
+    distanceMeters: number;
+    health: LocationHealth;
+    position: CurrentPosition;
+    radiusMeters: number;
+    arrivalRadiusMeters: number;
+    status: TripStatus;
+  }) {
+    const share = cloudShareRef.current;
+    if (!supabase || share.status !== "active" || !share.tripId) {
+      return;
+    }
+
+    const approximate = getApproximateLocation(position.lat, position.lng);
+    const { error } = await supabase
+      .from("trips")
+      .update({
+        status,
+        distance_m: distanceMeters,
+        current_lat: position.lat,
+        current_lng: position.lng,
+        approximate_lat: approximate.lat,
+        approximate_lng: approximate.lng,
+        last_location_at: position.updatedAt,
+        destination_lat: destination.lat as number,
+        destination_lng: destination.lng as number,
+        alert_radius_m: radiusMeters,
+        arrival_radius_m: arrivalRadiusMeters
+      })
+      .eq("id", share.tripId);
+
+    if (error) {
+      setCloudShare((current) => ({
+        ...current,
+        message: "雲端同步失敗，本機行程仍會繼續。"
+      }));
+      appendStatusEventOnce("雲端行程同步失敗", "定位更新同步到 Supabase 失敗");
+      return;
+    }
+
+    setCloudShare((current) => ({
+      ...current,
+      message: "雲端行程已同步"
+    }));
+    void notifyTripEvents(share.tripId, share.shareCode);
+  }
+
+  async function notifyTripEvents(tripId?: string, shareCode?: string) {
+    if (!tripId && !shareCode) {
+      return;
+    }
+
+    try {
+      await fetch("/api/notify/trip-events", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          tripId,
+          shareCode
+        })
+      });
+    } catch {
+      // 自動通知失敗不應影響本機行程或雲端同步。
+    }
+  }
+
+  async function endCloudTrip(status: string) {
+    const share = cloudShareRef.current;
+    if (!supabase || share.status !== "active" || !share.tripId) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from("trips")
+      .update({
+        status,
+        ended_at: new Date().toISOString()
+      })
+      .eq("id", share.tripId);
+
+    if (error) {
+      appendStatusEventOnce("雲端行程同步失敗", "停止行程同步到 Supabase 失敗");
+      return;
+    }
+
+    appendEvent("停止家人共享", "雲端共享行程已標記結束");
+  }
+
+  async function enableNotifications() {
+    if (!user) {
+      return;
+    }
+    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setNotificationState({
+        status: "此瀏覽器不支援",
+        message: "此瀏覽器不支援 Web Push。iPhone 請確認已加入主畫面並從主畫面開啟。"
+      });
+      return;
+    }
+    if (!isStandaloneMode()) {
+      setNotificationState({
+        status: "尚未啟用",
+        message: "iPhone 請先分享 → 加入主畫面，再從主畫面開啟 GeoClock 啟用通知。"
+      });
+    }
+    if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) {
+      setNotificationState({
+        status: "此瀏覽器不支援",
+        message: "尚未設定 VAPID public key，無法啟用通知。"
+      });
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    if (permission === "denied") {
+      setNotificationState({
+        status: "被拒絕",
+        message: "通知權限被拒絕，請到 Safari 網站設定中允許通知。"
+      });
+      appendEvent("通知訂閱失敗", "通知權限被拒絕");
+      return;
+    }
+    if (permission !== "granted") {
+      setNotificationState({
+        status: "尚未啟用",
+        message: "尚未允許通知。"
+      });
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
+      });
+
+      const response = await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          userCode: user.code,
+          role: "owner",
+          subscription: subscription.toJSON()
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("subscribe failed");
+      }
+
+      setNotificationState({
+        status: "已啟用",
+        message: "通知已啟用。連續呼叫提醒最多 15 秒，可由本人關閉。"
+      });
+      appendEvent("通知訂閱成功", "Web Push 通知已啟用");
+    } catch {
+      setNotificationState({
+        status: "尚未啟用",
+        message: "通知訂閱失敗。iPhone 請確認已加入主畫面並從主畫面開啟。"
+      });
+      appendEvent("通知訂閱失敗", "Web Push 通知訂閱失敗");
+    }
+  }
+
+  async function acknowledgeWakeRequest() {
+    if (!activeWakeRequest && !user) {
+      return;
+    }
+
+    await fetch("/api/wake/ack", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        wakeRequestId: activeWakeRequest?.id,
+        userCode: user?.code
+      })
+    }).catch(() => undefined);
+
+    setActiveWakeRequest(null);
+    setStrongAlert(null);
+    stopWakeTone();
+    appendEvent("已回應家人呼叫", "已按下我醒了");
+  }
+
+  function startWakeTone() {
+    if (wakeToneActive) {
+      return;
+    }
+    setWakeToneActive(true);
+    playAlert();
+    wakeToneIntervalRef.current = window.setInterval(playAlert, 2500);
+    wakeToneTimeoutRef.current = window.setTimeout(stopWakeTone, 15000);
+  }
+
+  function stopWakeTone() {
+    if (wakeToneIntervalRef.current !== null) {
+      window.clearInterval(wakeToneIntervalRef.current);
+      wakeToneIntervalRef.current = null;
+    }
+    if (wakeToneTimeoutRef.current !== null) {
+      window.clearTimeout(wakeToneTimeoutRef.current);
+      wakeToneTimeoutRef.current = null;
+    }
+    setWakeToneActive(false);
   }
 
   function stopGeolocationWatch() {
@@ -693,6 +1283,13 @@ export default function Home() {
     setSelectedDestinationId("");
     setDestinationNotice(null);
     setAdvancedDestinationOpen(false);
+    setPlaceCandidates([]);
+    setPlaceSearchState({ status: "idle", message: "" });
+    setRadiusMeters(DEFAULT_TRIP_SETTINGS.alertRadiusMeters);
+    setCustomRadiusInput("");
+    setRadiusNotice("");
+    setArrivalRadiusMeters(DEFAULT_TRIP_SETTINGS.arrivalRadiusMeters);
+    setPrivacySettings(DEFAULT_PRIVACY_SETTINGS);
     setFamily([]);
     setEvents([]);
     setStrongAlert(null);
@@ -746,9 +1343,15 @@ export default function Home() {
         <section className="alert-panel" role="alert">
           <p className="eyebrow">強提醒</p>
           <h2>{strongAlert}</h2>
-          <button className="secondary-button" onClick={() => setStrongAlert(null)}>
-            我知道了
-          </button>
+          {activeWakeRequest ? (
+            <button className="primary-button" onClick={acknowledgeWakeRequest}>
+              我醒了
+            </button>
+          ) : (
+            <button className="secondary-button" onClick={() => setStrongAlert(null)}>
+              我知道了
+            </button>
+          )}
         </section>
       ) : null}
 
@@ -760,6 +1363,17 @@ export default function Home() {
             <p className="code">{user.code}</p>
           </div>
           <p className="notice">網頁版需要保持旅程頁面開啟，鎖屏或切換 App 後定位可能暫停。</p>
+        </article>
+
+        <article className="card">
+          <p className="eyebrow">通知設定</p>
+          <h2>{notificationState.status}</h2>
+          <p className="notice">通知功能需將網站加入 iPhone 主畫面後使用。</p>
+          <p className="muted">{notificationState.message}</p>
+          <p className="muted">連續呼叫提醒最多 15 秒，可由本人關閉。</p>
+          <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={enableNotifications} type="button">
+            啟用通知
+          </button>
         </article>
 
         <article className="card">
@@ -787,6 +1401,27 @@ export default function Home() {
 
             <fieldset className="form-section">
               <legend>取得目的地定位</legend>
+              <div className="future-search-row">
+                <button className="secondary-button" disabled={placeSearchState.status === "loading"} onClick={searchPlaces} type="button">
+                  {placeSearchState.status === "loading" ? "搜尋中" : "搜尋地點"}
+                </button>
+                <span>使用 Geoapify 地點搜尋</span>
+              </div>
+              {placeSearchState.message ? (
+                <p className={placeSearchState.status === "success" ? "inline-status good" : "inline-status warning"}>
+                  {placeSearchState.message}
+                </p>
+              ) : null}
+              {placeCandidates.length > 0 ? (
+                <div className="candidate-list">
+                  {placeCandidates.map((candidate) => (
+                    <button className="candidate-button" key={candidate.id} onClick={() => selectPlaceCandidate(candidate)} type="button">
+                      <strong>{candidate.label}</strong>
+                      <span>{candidate.address}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               <label>
                 Google Maps 分享連結，可選
                 <input
@@ -801,12 +1436,6 @@ export default function Home() {
                   {mapsLocationPreview ? "已取得目的地定位" : "這個連結暫時無法取得目的地定位，請確認是否為 Google Maps 分享連結。"}
                 </p>
               ) : null}
-              <div className="future-search-row">
-                <button className="secondary-button" type="button" disabled>
-                  搜尋地點
-                </button>
-                <span>下一版開放</span>
-              </div>
             </fieldset>
 
             <fieldset className="form-section">
@@ -827,7 +1456,7 @@ export default function Home() {
                     <input
                       inputMode="decimal"
                       value={destinationForm.manualLat}
-                      onChange={(event) => setDestinationForm((form) => ({ ...form, manualLat: event.target.value }))}
+                      onChange={(event) => setDestinationForm((form) => ({ ...form, manualLat: event.target.value, locationSource: "manual" }))}
                       placeholder="例如：24.1368"
                     />
                   </label>
@@ -836,7 +1465,7 @@ export default function Home() {
                     <input
                       inputMode="decimal"
                       value={destinationForm.manualLng}
-                      onChange={(event) => setDestinationForm((form) => ({ ...form, manualLng: event.target.value }))}
+                      onChange={(event) => setDestinationForm((form) => ({ ...form, manualLng: event.target.value, locationSource: "manual" }))}
                       placeholder="例如：120.6850"
                     />
                   </label>
@@ -887,18 +1516,58 @@ export default function Home() {
 
       <section className="card trip-card">
         <p className="eyebrow">行程模式</p>
+        <h2>快到提醒距離</h2>
         <div className="radius-options">
           {RADIUS_OPTIONS.map((option) => (
             <button
               className={radiusMeters === option.value ? "selected" : ""}
               key={option.value}
-              onClick={() => setRadiusMeters(option.value)}
+              onClick={() => chooseAlertRadius(option.value)}
               type="button"
             >
               {option.label}
             </button>
           ))}
         </div>
+        <div className="custom-radius-row">
+          <label>
+            自訂提醒距離，公尺
+            <input
+              inputMode="numeric"
+              min={MIN_ALERT_RADIUS_METERS}
+              max={MAX_ALERT_RADIUS_METERS}
+              value={customRadiusInput}
+              onChange={(event) => setCustomRadiusInput(event.target.value)}
+              placeholder="例如：750"
+            />
+          </label>
+          <button className="secondary-button" onClick={applyCustomAlertRadius} type="button">
+            套用
+          </button>
+        </div>
+        <details className="advanced-settings">
+          <summary>進階設定</summary>
+          <div className="stack">
+            <p className="field-hint">已抵達判斷距離預設為 100 m，只用來判斷是否已到目的地附近，不是主要提醒距離。</p>
+            <div className="radius-options compact">
+              {ARRIVAL_RADIUS_OPTIONS.map((option) => (
+                <button
+                  className={arrivalRadiusMeters === option ? "selected" : ""}
+                  key={option}
+                  onClick={() => chooseArrivalRadius(option)}
+                  type="button"
+                >
+                  {formatDistance(option)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </details>
+        <div className="status-grid">
+          <Metric label="快到提醒距離" value={formatDistance(radiusMeters)} />
+          <Metric label="已抵達判斷距離" value={formatDistance(arrivalRadiusMeters)} />
+        </div>
+        {radiusNotice ? <p className="form-notice">{radiusNotice}</p> : null}
         <div className="trip-actions">
           <button
             className="primary-button"
@@ -922,7 +1591,7 @@ export default function Home() {
         <section className="card preflight-card">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">V0.1.2 啟動前檢查</p>
+              <p className="eyebrow">V0.3 啟動前檢查</p>
               <h2>{preflightDestination.name}</h2>
             </div>
           </div>
@@ -961,17 +1630,53 @@ export default function Home() {
           <h2>{activeTrip?.status ?? "尚未開始"}</h2>
           <p className="journey-destination">{activeTrip?.destination.name ?? selectedDestination?.name ?? "尚未選擇目的地"}</p>
         </div>
+        {mapDestination && hasCoordinates(mapDestination) ? (
+          <div className="map-block">
+            <TripMap currentPosition={mapPosition} destination={mapDestination} radiusMeters={mapRadiusMeters} />
+            <div className="map-summary">
+              <Metric label="目前位置最後更新" value={formatTime(mapPosition?.updatedAt)} />
+              <Metric label="目的地" value={mapDestination.name} />
+              <Metric label="距離目的地" value={formatDistance(activeTrip?.distanceMeters)} />
+            </div>
+          </div>
+        ) : null}
         <div className="status-grid">
           <Metric label="目的地" value={activeTrip?.destination.address ?? selectedDestination?.address ?? "尚未設定"} />
           <Metric label="目前位置" value={formatPosition(activeTrip?.lastPosition)} />
           <Metric label="距離目的地" value={formatDistance(activeTrip?.distanceMeters)} />
           <Metric label="最後更新時間" value={formatTime(activeTrip?.lastPosition?.updatedAt)} />
-          <Metric label="提醒半徑" value={formatDistance(activeTrip?.radiusMeters ?? radiusMeters)} />
+          <Metric label="快到提醒距離" value={formatDistance(activeTrip?.radiusMeters ?? radiusMeters)} />
+          <Metric label="已抵達判斷距離" value={formatDistance(displayArrivalRadiusMeters)} />
           <Metric label="定位健康度" value={activeTrip?.health ?? "正常"} />
           <Metric label="防鎖屏" value={wakeLockStatus} />
         </div>
         <p className="notice">網頁版需要保持旅程頁面開啟，鎖屏或切換 App 後定位可能暫停。</p>
       </section>
+
+      {activeTrip ? (
+        <section className="card cloud-share-card">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">家人共享</p>
+              <h2>分享這趟行程</h2>
+            </div>
+          </div>
+          <p className="notice">分享連結持有者可以查看行程狀態與粗略位置。V0.3 暫時不做通知與 Web Push。</p>
+          {cloudShare.status === "active" && cloudShare.shareUrl ? (
+            <div className="share-link-box">
+              <span>{cloudShare.shareUrl}</span>
+              <button className="secondary-button" onClick={copyShareLink} type="button">
+                複製分享連結
+              </button>
+            </div>
+          ) : (
+            <button className="primary-button" disabled={cloudShare.status === "creating"} onClick={enableCloudSharing} type="button">
+              {cloudShare.status === "creating" ? "建立中" : "開啟家人共享"}
+            </button>
+          )}
+          {cloudShare.message ? <p className={cloudShare.status === "error" ? "inline-status warning" : "inline-status good"}>{cloudShare.message}</p> : null}
+        </section>
+      ) : null}
 
       <section className="grid">
         <article className="card">
@@ -994,6 +1699,24 @@ export default function Home() {
             </button>
           </form>
           <p className="notice">未來雲端版中，擁有可叫醒我權限的人可以按按鈕發送 Push 通知。</p>
+          <label className="toggle-row">
+            <input
+              checked={privacySettings.familyApproximateLocation}
+              onChange={(event) =>
+                setPrivacySettings((settings) => ({
+                  ...settings,
+                  familyApproximateLocation: event.target.checked
+                }))
+              }
+              type="checkbox"
+            />
+            <span>家人查看時只顯示粗略位置</span>
+          </label>
+          {privacySettings.familyApproximateLocation && approximateLocationPreview ? (
+            <p className="field-hint">
+              粗略位置預覽：{approximateLocationPreview.lat.toFixed(4)}, {approximateLocationPreview.lng.toFixed(4)}
+            </p>
+          ) : null}
           <button className="secondary-button full-width" onClick={simulateWake}>
             模擬叫醒通知
           </button>
@@ -1022,10 +1745,23 @@ export default function Home() {
       </section>
 
       <section className="card">
-        <p className="eyebrow">事件紀錄</p>
-        {events.length === 0 ? (
-          <p className="muted">尚無事件。</p>
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">事件紀錄</p>
+            <h2>{events.length} 筆事件</h2>
+          </div>
+          <button className="secondary-button small-button" onClick={() => setEventsExpanded((expanded) => !expanded)} type="button">
+            {eventsExpanded ? "收合事件紀錄" : "展開事件紀錄"}
+          </button>
+        </div>
+        {events[0] ? (
+          <p className="muted">
+            最近一筆：{events[0].type}，{events[0].message}
+          </p>
         ) : (
+          <p className="muted">尚無事件。</p>
+        )}
+        {eventsExpanded && events.length > 0 ? (
           <ol className="event-list">
             {events.map((event) => (
               <li key={event.id}>
@@ -1035,7 +1771,7 @@ export default function Home() {
               </li>
             ))}
           </ol>
-        )}
+        ) : null}
       </section>
     </main>
   );
@@ -1083,6 +1819,31 @@ function createId(prefix: string) {
   }
 
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createShareCode() {
+  return `share-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getSafeArrivalRadius(arrivalRadius: number, alertRadius: number) {
+  return Math.min(arrivalRadius, alertRadius);
+}
+
+function isStandaloneMode() {
+  return window.matchMedia("(display-mode: standalone)").matches || ("standalone" in navigator && Boolean(navigator.standalone));
+}
+
+function urlBase64ToUint8Array(base64String: string) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = `${base64String}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+
+  for (let i = 0; i < rawData.length; i += 1) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+
+  return outputArray;
 }
 
 function getAlertAudio() {

@@ -71,7 +71,12 @@ export function getLocationHealth(lastUpdatedAt?: string, now = Date.now()): Loc
   return "正常";
 }
 
-export function getTripStatus(distanceMeters: number | undefined, radiusMeters: number, health: LocationHealth): TripStatus {
+export function getTripStatus(
+  distanceMeters: number | undefined,
+  alertRadiusMeters: number,
+  arrivalRadiusMeters: number,
+  health: LocationHealth
+): TripStatus {
   if (health === "中斷") {
     return "定位中斷";
   }
@@ -81,10 +86,10 @@ export function getTripStatus(distanceMeters: number | undefined, radiusMeters: 
   if (typeof distanceMeters !== "number") {
     return "行程中";
   }
-  if (distanceMeters < 100) {
+  if (distanceMeters <= arrivalRadiusMeters) {
     return "已抵達";
   }
-  if (distanceMeters < radiusMeters) {
+  if (distanceMeters <= alertRadiusMeters) {
     return "快到目的地";
   }
   if (distanceMeters < 5000) {
@@ -101,6 +106,13 @@ export function formatDistance(meters?: number) {
     return `${(meters / 1000).toFixed(2)} km`;
   }
   return `${Math.round(meters)} m`;
+}
+
+export function getApproximateLocation(lat: number, lng: number) {
+  return {
+    lat: Math.round(lat * 2000) / 2000,
+    lng: Math.round(lng * 2000) / 2000
+  };
 }
 
 function toRadians(degrees: number) {

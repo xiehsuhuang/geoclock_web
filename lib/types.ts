@@ -11,6 +11,15 @@ export type LocationHealth = "正常" | "延遲" | "中斷";
 
 export type FamilyPermission = "只看狀態" | "可看位置" | "可叫醒我";
 
+export type PlaceSearchCandidate = {
+  id: string;
+  label: string;
+  address: string;
+  lat: number;
+  lng: number;
+  source: "geoapify";
+};
+
 export type EventType =
   | "建立使用者"
   | "新增目的地"
@@ -40,7 +49,28 @@ export type EventType =
   | "震動不支援"
   | "防鎖屏啟用成功"
   | "防鎖屏啟用失敗"
-  | "正式開始旅程";
+  | "正式開始旅程"
+  | "開啟家人共享"
+  | "雲端行程同步成功"
+  | "雲端行程同步失敗"
+  | "停止家人共享"
+  | "通知訂閱成功"
+  | "通知訂閱失敗"
+  | "收到家人呼叫"
+  | "已回應家人呼叫";
+
+export type WakeRequestRow = {
+  id: string;
+  trip_id: string | null;
+  share_code: string;
+  from_viewer_code: string | null;
+  to_owner_code: string;
+  status: "active" | "acknowledged" | "stopped" | string;
+  message: string | null;
+  created_at: string;
+  acknowledged_at: string | null;
+  stopped_at: string | null;
+};
 
 export type UserProfile = {
   nickname: string;
@@ -84,9 +114,40 @@ export type CurrentPosition = {
 export type ActiveTrip = {
   destination: Destination;
   radiusMeters: number;
+  arrivalRadiusMeters: number;
   startedAt: string;
   status: TripStatus;
   health: LocationHealth;
   lastPosition?: CurrentPosition;
   distanceMeters?: number;
+};
+
+export type PrivacySettings = {
+  familyApproximateLocation: boolean;
+};
+
+export type TripSettings = {
+  alertRadiusMeters: number;
+  arrivalRadiusMeters: number;
+};
+
+export type CloudTripRow = {
+  id: string;
+  share_code: string;
+  owner_code: string;
+  destination_name: string;
+  destination_address: string | null;
+  destination_lat: number;
+  destination_lng: number;
+  alert_radius_m: number;
+  arrival_radius_m?: number | null;
+  status: string;
+  distance_m: number | null;
+  current_lat: number | null;
+  current_lng: number | null;
+  approximate_lat: number | null;
+  approximate_lng: number | null;
+  last_location_at: string | null;
+  started_at: string;
+  ended_at: string | null;
 };
