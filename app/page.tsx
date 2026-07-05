@@ -12,6 +12,8 @@ import {
   normalizeDestinationIdentity,
   parseGoogleMapsCoordinates
 } from "@/lib/geo";
+import { getNotificationDiagnostics, getStandaloneHint, isStandaloneMode, urlBase64ToUint8Array } from "@/lib/notificationDiagnostics";
+import { playAlertSoundFor, startAlertSoundLoop, stopAlertSoundLoop, unlockAlertSound } from "@/lib/sound";
 import { clearGeoClockStorage, DEFAULT_PRIVACY_SETTINGS, DEFAULT_TRIP_SETTINGS, loadSnapshot, STORAGE_KEYS, writeStored } from "@/lib/storage";
 import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
 import type {
@@ -24,6 +26,7 @@ import type {
   FamilyMember,
   FamilyPermission,
   LocationHealth,
+  NotificationDiagnostic,
   PlaceSearchCandidate,
   PrivacySettings,
   TripStatus,
@@ -46,8 +49,13 @@ const ARRIVAL_RADIUS_OPTIONS = [50, 100, 200, 300];
 const DEFAULT_ARRIVAL_RADIUS_METERS = 100;
 const MIN_ALERT_RADIUS_METERS = 50;
 const MAX_ALERT_RADIUS_METERS = 10000;
+const VIEWER_CODE_STORAGE_KEY = "geoclock.web.viewerCode";
 const MILESTONE_METERS = [5000, 2000, 1000, 500, 300];
-const PERMISSIONS: FamilyPermission[] = ["只看狀態", "可看位置", "可叫醒我"];
+const PERMISSIONS: { label: string; value: FamilyPermission }[] = [
+  { label: "只看狀態", value: "status_only" },
+  { label: "接收到站通知", value: "notify" },
+  { label: "可呼叫我", value: "wake" }
+];
 
 type PreflightStatus = "尚未測試" | "測試中" | "成功" | "失敗" | "不支援";
 
@@ -146,11 +154,16 @@ export default function Home() {
   const [activeTrip, setActiveTrip] = useState<ActiveTrip | null>(null);
   const [family, setFamily] = useState<FamilyMember[]>([]);
   const [familyCode, setFamilyCode] = useState("");
-  const [familyPermission, setFamilyPermission] = useState<FamilyPermission>("只看狀態");
+  const [familyPermission, setFamilyPermission] = useState<FamilyPermission>("status_only");
+  const [viewerShareCode, setViewerShareCode] = useState("");
+  const [viewerCodeInput, setViewerCodeInput] = useState("");
+  const [viewerEntryMessage, setViewerEntryMessage] = useState("");
   const [privacySettings, setPrivacySettings] = useState<PrivacySettings>(DEFAULT_PRIVACY_SETTINGS);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [wakeLockStatus, setWakeLockStatus] = useState("尚未啟用");
   const [audioStatus, setAudioStatus] = useState("提醒音尚未啟用");
+  const [tripAlertSoundStatus, setTripAlertSoundStatus] = useState<"未解鎖" | "已解鎖" | "提醒中" | "已停止">("未解鎖");
+  const [ownerTripMuted, setOwnerTripMuted] = useState(false);
   const [strongAlert, setStrongAlert] = useState<string | null>(null);
   const [cloudShare, setCloudShare] = useState<CloudShareState>({
     status: "idle",
@@ -160,6 +173,7 @@ export default function Home() {
     status: "尚未啟用",
     message: "通知功能需將網站加入 iPhone 主畫面後使用。"
   });
+  const [notificationDiagnostics, setNotificationDiagnostics] = useState<NotificationDiagnostic[]>([]);
   const [activeWakeRequest, setActiveWakeRequest] = useState<WakeRequestRow | null>(null);
   const [wakeToneActive, setWakeToneActive] = useState(false);
   const [eventsExpanded, setEventsExpanded] = useState(false);
@@ -226,9 +240,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    return () => {
+      stopAlertSoundLoop();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!hydrated) {
       return;
     }
+    const existingViewerCode = window.localStorage.getItem(VIEWER_CODE_STORAGE_KEY);
+    const nextViewerCode = existingViewerCode || createFamilyViewerCode();
+    window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, nextViewerCode);
+    setViewerCodeInput(nextViewerCode);
+  }, [hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+
+    void getNotificationDiagnostics().then(setNotificationDiagnostics);
 
     if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
       setNotificationState({
@@ -297,6 +329,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!activeTrip) {
+      stopAlertSoundLoop();
+      if (tripAlertSoundStatus === "提醒中") {
+        setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
+      }
       return;
     }
 
@@ -309,6 +345,23 @@ export default function Home() {
 
     return () => window.clearInterval(interval);
   }, [activeTrip]);
+
+  useEffect(() => {
+    if (!activeTrip || ownerTripMuted || !isTripAlertCondition(activeTrip)) {
+      stopAlertSoundLoop();
+      if (tripAlertSoundStatus === "提醒中") {
+        setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
+      }
+      return;
+    }
+
+    setTripAlertSoundStatus("提醒中");
+    startAlertSoundLoop({
+      playMs: 5000,
+      intervalMs: 10000,
+      onError: (error) => setAudioStatus(`提醒音播放失敗：${error}`)
+    });
+  }, [activeTrip?.distanceMeters, activeTrip?.radiusMeters, activeTrip?.arrivalRadiusMeters, activeTrip?.status, ownerTripMuted]);
 
   useEffect(() => {
     return () => {
@@ -703,20 +756,27 @@ export default function Home() {
   }
 
   async function testAlertAudio() {
-    try {
-      const audio = getAlertAudio();
-      alertAudioRef.current = audio;
-      audio.currentTime = 0;
-      await audio.play();
+    const unlocked = await unlockAlertSound();
+    if (unlocked.ok) {
+      const played = await playAlertSoundFor(5000);
+      if (!played.ok) {
+        const message = played.error ?? "提示音播放失敗，畫面仍會強提醒";
+        setAudioStatus(message);
+        setAudioCheck({ status: "失敗", message });
+        appendEvent("提示音測試失敗", message);
+        return;
+      }
       setAudioStatus("提示音已解鎖");
+      setTripAlertSoundStatus("已解鎖");
       setAudioCheck({ status: "成功", message: "提示音已解鎖" });
       appendEvent("提示音測試成功", "提示音已解鎖");
-    } catch {
-      const message = "提示音被瀏覽器阻擋，請確認 iPhone 不是靜音模式，並再點一次測試提示音。";
-      setAudioStatus(message);
-      setAudioCheck({ status: "失敗", message });
-      appendEvent("提示音測試失敗", message);
+      return;
     }
+
+    const message = unlocked.error ?? "提示音被瀏覽器阻擋，請確認 iPhone 不是靜音模式，並再點一次測試提示音。";
+    setAudioStatus(message);
+    setAudioCheck({ status: "失敗", message });
+    appendEvent("提示音測試失敗", message);
   }
 
   function testVibration() {
@@ -761,6 +821,7 @@ export default function Home() {
     milestoneRef.current = new Set();
     eventGateRef.current = new Set();
     tripStartedRef.current = false;
+    setOwnerTripMuted(false);
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
     appendEvent(
       "正式開始旅程",
@@ -874,6 +935,8 @@ export default function Home() {
   function stopTrip() {
     stopGeolocationWatch();
     releaseWakeLock();
+    stopAlertSoundLoop();
+    setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
     if (activeTrip) {
       appendEvent("停止行程", `${activeTrip.destination.name} 的行程已停止`);
       void endCloudTrip(activeTrip.status);
@@ -972,6 +1035,34 @@ export default function Home() {
     }
   }
 
+  async function copyShareCode() {
+    if (!cloudShare.shareCode) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(cloudShare.shareCode);
+      setCloudShare((current) => ({ ...current, message: "行程代碼已複製" }));
+    } catch {
+      setCloudShare((current) => ({ ...current, message: "複製失敗，請手動選取行程代碼" }));
+    }
+  }
+
+  function openViewerTrip(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const shareCode = viewerShareCode.trim();
+    const viewerCode = viewerCodeInput.trim().toUpperCase();
+    if (!shareCode) {
+      setViewerEntryMessage("請輸入行程代碼。");
+      return;
+    }
+    if (viewerCode) {
+      window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, viewerCode);
+    }
+    const query = viewerCode ? `?viewer=${encodeURIComponent(viewerCode)}` : "";
+    window.location.href = `/share/${encodeURIComponent(shareCode)}${query}`;
+  }
+
   async function syncCloudTrip({
     destination,
     distanceMeters,
@@ -1024,7 +1115,9 @@ export default function Home() {
       ...current,
       message: "雲端行程已同步"
     }));
-    void notifyTripEvents(share.tripId, share.shareCode);
+    if (!ownerTripMuted) {
+      void notifyTripEvents(share.tripId, share.shareCode);
+    }
   }
 
   async function notifyTripEvents(tripId?: string, shareCode?: string) {
@@ -1045,6 +1138,36 @@ export default function Home() {
       });
     } catch {
       // 自動通知失敗不應影響本機行程或雲端同步。
+    }
+  }
+
+  async function stopOwnerTripNotifications() {
+    setOwnerTripMuted(true);
+    setTripAlertSoundStatus("已停止");
+    stopAlertSoundLoop();
+    const share = cloudShareRef.current;
+    if (!user || share.status !== "active" || !share.shareCode) {
+      setAudioStatus("本趟通知已停止。若尚未開啟家人共享，停止狀態只保留在本頁。");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/notify/mute-trip", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          share_code: share.shareCode,
+          role: "owner",
+          user_code: user.code,
+          event_type: "all"
+        })
+      });
+      const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      setAudioStatus(payload.ok ? "本趟通知已停止。" : `本趟通知停止失敗：${payload.error ?? "未知錯誤"}`);
+    } catch (error) {
+      setAudioStatus(`本趟通知停止失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
     }
   }
 
@@ -1074,6 +1197,7 @@ export default function Home() {
     if (!user) {
       return;
     }
+    setNotificationDiagnostics(await getNotificationDiagnostics());
     if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
       setNotificationState({
         status: "此瀏覽器不支援",
@@ -1118,6 +1242,7 @@ export default function Home() {
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
       });
+      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "尚未寫入"));
 
       const response = await fetch("/api/push/subscribe", {
         method: "POST",
@@ -1132,19 +1257,23 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error("subscribe failed");
+        const payload = (await response.json().catch(() => ({}))) as { message?: string };
+        throw new Error(payload.message ?? "通知訂閱寫入 Supabase 失敗");
       }
 
       setNotificationState({
         status: "已啟用",
         message: "通知已啟用。連續呼叫提醒最多 15 秒，可由本人關閉。"
       });
+      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "成功"));
       appendEvent("通知訂閱成功", "Web Push 通知已啟用");
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Web Push 通知訂閱失敗";
       setNotificationState({
         status: "尚未啟用",
-        message: "通知訂閱失敗。iPhone 請確認已加入主畫面並從主畫面開啟。"
+        message: `通知訂閱失敗：${message}`
       });
+      setNotificationDiagnostics(await getNotificationDiagnostics(null, message));
       appendEvent("通知訂閱失敗", "Web Push 通知訂閱失敗");
     }
   }
@@ -1232,22 +1361,17 @@ export default function Home() {
       navigator.vibrate([300, 120, 300, 120, 600]);
     }
 
-    const audio = alertAudioRef.current;
-    if (!audio) {
-      setAudioStatus("提醒音播放失敗，畫面仍會強提醒");
-      return;
-    }
-
-    audio.currentTime = 0;
-    audio.play().catch(() => {
-      setAudioStatus("提醒音播放失敗，畫面仍會強提醒");
+    void playAlertSoundFor(5000).then((result) => {
+      if (!result.ok) {
+        setAudioStatus(result.error ?? "提醒音播放失敗，畫面仍會強提醒");
+      }
     });
   }
 
-  function addFamilyMember(event: FormEvent<HTMLFormElement>) {
+  async function addFamilyMember(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const code = familyCode.trim().toUpperCase();
-    if (!code) {
+    if (!code || !user) {
       return;
     }
 
@@ -1259,12 +1383,37 @@ export default function Home() {
     };
     setFamily((current) => [member, ...current.filter((item) => item.code !== code)]);
     setFamilyCode("");
-    appendEvent("新增家人權限", `${code} 已加入，權限：${familyPermission}`);
+    appendEvent("新增家人權限", `${code} 已加入，權限：${getFamilyPermissionLabel(familyPermission)}`);
+
+    if (!supabase) {
+      return;
+    }
+
+    const { error } = await supabase.from("permissions").upsert(
+      {
+        owner_code: user.code,
+        viewer_code: code,
+        permission_level: familyPermission,
+        enabled: true
+      },
+      { onConflict: "owner_code,viewer_code,permission_level" }
+    );
+
+    if (error) {
+      appendStatusEventOnce("雲端行程同步失敗", `家人權限寫入 Supabase 失敗：${error.message}`);
+    }
   }
 
-  function deleteFamilyMember(member: FamilyMember) {
+  async function deleteFamilyMember(member: FamilyMember) {
     setFamily((current) => current.filter((item) => item.id !== member.id));
     appendEvent("刪除家人權限", `${member.code} 的權限已刪除`);
+    if (supabase && user) {
+      try {
+        await supabase.from("permissions").update({ enabled: false }).eq("owner_code", user.code).eq("viewer_code", member.code);
+      } catch {
+        appendStatusEventOnce("雲端行程同步失敗", "刪除家人權限同步到 Supabase 失敗");
+      }
+    }
   }
 
   function simulateWake() {
@@ -1307,7 +1456,11 @@ export default function Home() {
         <section className="hero-panel">
           <p className="eyebrow">GeoClock Web</p>
           <h1>到站提醒與家人協助叫醒</h1>
-          <p className="muted">第一版使用本機資料，不登入、不接雲端。請先建立你的本機暱稱。</p>
+          <div className="entry-tabs">
+            <span>我要開始行程</span>
+            <span>我是家人，輸入行程代碼查看</span>
+          </div>
+          <p className="muted">本人請先建立本機暱稱；家人也可以直接用行程代碼查看共享行程。</p>
           <form className="stack" onSubmit={handleCreateUser}>
             <label>
               暱稱
@@ -1320,6 +1473,21 @@ export default function Home() {
             </label>
             <button className="primary-button" type="submit">
               建立使用者
+            </button>
+          </form>
+          <form className="stack viewer-entry" onSubmit={openViewerTrip}>
+            <p className="eyebrow">我是家人，要查看行程</p>
+            <label>
+              行程代碼
+              <input value={viewerShareCode} onChange={(event) => setViewerShareCode(event.target.value)} placeholder="貼上或輸入 share_code" />
+            </label>
+            <label>
+              我的家人代碼，可選
+              <input value={viewerCodeInput} onChange={(event) => setViewerCodeInput(event.target.value.toUpperCase())} placeholder="例如：FAMILY-1234" />
+            </label>
+            {viewerEntryMessage ? <p className="warning">{viewerEntryMessage}</p> : null}
+            <button className="secondary-button" type="submit">
+              查看行程
             </button>
           </form>
         </section>
@@ -1338,6 +1506,28 @@ export default function Home() {
           重設資料
         </button>
       </header>
+
+      <section className="card">
+        <p className="eyebrow">入口</p>
+        <div className="entry-tabs">
+          <span>我要開始行程</span>
+          <span>我是家人，輸入行程代碼查看</span>
+        </div>
+        <form className="viewer-entry" onSubmit={openViewerTrip}>
+          <label>
+            行程代碼
+            <input value={viewerShareCode} onChange={(event) => setViewerShareCode(event.target.value)} placeholder="貼上或輸入 share_code" />
+          </label>
+          <label>
+            我的家人代碼，可選
+            <input value={viewerCodeInput} onChange={(event) => setViewerCodeInput(event.target.value.toUpperCase())} placeholder="例如：FAMILY-1234" />
+          </label>
+          <button className="secondary-button" type="submit">
+            查看行程
+          </button>
+          {viewerEntryMessage ? <p className="warning">{viewerEntryMessage}</p> : null}
+        </form>
+      </section>
 
       {strongAlert ? (
         <section className="alert-panel" role="alert">
@@ -1369,11 +1559,13 @@ export default function Home() {
           <p className="eyebrow">通知設定</p>
           <h2>{notificationState.status}</h2>
           <p className="notice">通知功能需將網站加入 iPhone 主畫面後使用。</p>
+          <p className="muted">{getStandaloneHint()}</p>
           <p className="muted">{notificationState.message}</p>
           <p className="muted">連續呼叫提醒最多 15 秒，可由本人關閉。</p>
           <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={enableNotifications} type="button">
             啟用通知
           </button>
+          <DiagnosticList items={notificationDiagnostics} />
         </article>
 
         <article className="card">
@@ -1587,6 +1779,24 @@ export default function Home() {
         <p className="muted">{audioStatus}</p>
       </section>
 
+      <section className="card">
+        <p className="eyebrow">本趟提醒</p>
+        <div className="status-grid">
+          <Metric label="提醒聲狀態" value={tripAlertSoundStatus} />
+          <Metric label="本趟通知" value={ownerTripMuted ? "已停止" : "啟用中"} />
+        </div>
+        <p className="notice">前景開著時會每 10 秒響一次，每次約 5 秒。</p>
+        <p className="muted">背景或鎖屏時只能依賴系統通知聲，網頁不能保證持續響鈴。</p>
+        <div className="trip-actions">
+          <button className="secondary-button" onClick={testAlertAudio} type="button">
+            測試提示音
+          </button>
+          <button className="primary-button" disabled={!activeTrip || ownerTripMuted} onClick={stopOwnerTripNotifications} type="button">
+            收到，停止本趟通知
+          </button>
+        </div>
+      </section>
+
       {preflightOpen && preflightDestination ? (
         <section className="card preflight-card">
           <div className="section-heading">
@@ -1661,13 +1871,25 @@ export default function Home() {
               <h2>分享這趟行程</h2>
             </div>
           </div>
-          <p className="notice">分享連結持有者可以查看行程狀態與粗略位置。V0.3 暫時不做通知與 Web Push。</p>
+          <p className="notice">家人可以輸入行程代碼查看，也可以使用分享連結。分享頁只顯示粗略位置。</p>
           {cloudShare.status === "active" && cloudShare.shareUrl ? (
-            <div className="share-link-box">
-              <span>{cloudShare.shareUrl}</span>
-              <button className="secondary-button" onClick={copyShareLink} type="button">
-                複製分享連結
-              </button>
+            <div className="stack">
+              <div className="status-grid">
+                <Metric label="我的代碼" value={user.code} />
+                <Metric label="行程代碼" value={cloudShare.shareCode ?? "尚未建立"} />
+              </div>
+              <p className="big-code">{cloudShare.shareCode}</p>
+              <div className="trip-actions">
+                <button className="secondary-button" onClick={copyShareCode} type="button">
+                  複製行程代碼
+                </button>
+                <button className="secondary-button" onClick={copyShareLink} type="button">
+                  複製分享連結
+                </button>
+              </div>
+              <div className="share-link-box">
+                <span>{cloudShare.shareUrl}</span>
+              </div>
             </div>
           ) : (
             <button className="primary-button" disabled={cloudShare.status === "creating"} onClick={enableCloudSharing} type="button">
@@ -1690,7 +1912,9 @@ export default function Home() {
               權限
               <select value={familyPermission} onChange={(event) => setFamilyPermission(event.target.value as FamilyPermission)}>
                 {PERMISSIONS.map((permission) => (
-                  <option key={permission}>{permission}</option>
+                  <option key={permission.value} value={permission.value}>
+                    {permission.label}
+                  </option>
                 ))}
               </select>
             </label>
@@ -1732,7 +1956,7 @@ export default function Home() {
                 <div className="family-row" key={member.id}>
                   <div>
                     <strong>{member.code}</strong>
-                    <span>{member.permission}</span>
+                    <span>{getFamilyPermissionLabel(member.permission)}</span>
                   </div>
                   <button className="danger-button" onClick={() => deleteFamilyMember(member)}>
                     刪除
@@ -1786,6 +2010,23 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
+function DiagnosticList({ items }: { items: NotificationDiagnostic[] }) {
+  if (items.length === 0) {
+    return <p className="field-hint">尚未取得通知診斷。</p>;
+  }
+
+  return (
+    <div className="diagnostic-list">
+      {items.map((item) => (
+        <div className="diagnostic-row" key={item.label}>
+          <span>{item.label}</span>
+          <strong className={item.ok ? "good" : "warning"}>{item.value}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function PreflightRow({
   actionLabel,
   detail,
@@ -1825,25 +2066,26 @@ function createShareCode() {
   return `share-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createFamilyViewerCode() {
+  return `FAMILY-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+function getFamilyPermissionLabel(permission: string) {
+  return PERMISSIONS.find((item) => item.value === permission)?.label ?? permission;
+}
+
 function getSafeArrivalRadius(arrivalRadius: number, alertRadius: number) {
   return Math.min(arrivalRadius, alertRadius);
 }
 
-function isStandaloneMode() {
-  return window.matchMedia("(display-mode: standalone)").matches || ("standalone" in navigator && Boolean(navigator.standalone));
-}
-
-function urlBase64ToUint8Array(base64String: string) {
-  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = `${base64String}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-
-  for (let i = 0; i < rawData.length; i += 1) {
-    outputArray[i] = rawData.charCodeAt(i);
+function isTripAlertCondition(trip: ActiveTrip) {
+  if (trip.status === "定位中斷" || trip.status === "定位延遲") {
+    return false;
   }
-
-  return outputArray;
+  if (typeof trip.distanceMeters !== "number") {
+    return false;
+  }
+  return trip.distanceMeters <= trip.radiusMeters || trip.distanceMeters <= trip.arrivalRadiusMeters;
 }
 
 function getAlertAudio() {

@@ -9,7 +9,7 @@ export type TripStatus =
 
 export type LocationHealth = "正常" | "延遲" | "中斷";
 
-export type FamilyPermission = "只看狀態" | "可看位置" | "可叫醒我";
+export type FamilyPermission = "status_only" | "notify" | "wake";
 
 export type PlaceSearchCandidate = {
   id: string;
@@ -150,4 +150,10 @@ export type CloudTripRow = {
   last_location_at: string | null;
   started_at: string;
   ended_at: string | null;
+};
+
+export type NotificationDiagnostic = {
+  label: string;
+  value: string;
+  ok?: boolean;
 };

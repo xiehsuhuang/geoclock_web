@@ -15,7 +15,13 @@ self.addEventListener("push", (event) => {
     icon: "/icon.svg",
     badge: "/icon.svg",
     tag: payload.tag || "geoclock-wake",
-    renotify: true
+    renotify: true,
+    actions: [
+      {
+        action: "open",
+        title: "打開 GeoClock"
+      }
+    ]
   };
 
   event.waitUntil(self.registration.showNotification(title, options));
