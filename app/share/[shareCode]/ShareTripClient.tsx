@@ -1,103 +1,142 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { formatDistance, getLocationHealth } from "@/lib/geo";
-import { getNotificationDiagnostics, getStandaloneHint, isStandaloneMode, urlBase64ToUint8Array } from "@/lib/notificationDiagnostics";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatDistance } from "@/lib/geo";
+import { getNotificationDiagnostics, getStandaloneHint, urlBase64ToUint8Array } from "@/lib/notificationDiagnostics";
 import { playAlertSoundFor, startAlertSoundLoop, stopAlertSoundLoop, unlockAlertSound } from "@/lib/sound";
 import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
-import type { CloudTripRow, CurrentPosition, Destination, LocationHealth, NotificationDiagnostic } from "@/lib/types";
+import type { CloudTripRow, CurrentPosition, Destination, NotificationDiagnostic } from "@/lib/types";
 
 const TripMap = dynamic(() => import("@/components/TripMap"), {
   ssr: false
 });
 
-type ShareState =
-  | {
-      status: "loading";
-      message: string;
-    }
-  | {
-      status: "ready";
-      trip: CloudTripRow;
-    }
-  | {
-      status: "missing" | "error";
-      message: string;
-    };
+type ShareLoadState = {
+  initialLoading: boolean;
+  refreshing: boolean;
+  refreshError: string;
+  lastSuccessfulFetchAt: string | null;
+  missingMessage: string;
+  trip: CloudTripRow | null;
+};
 
 type ShareNotificationState = {
   status: "尚未啟用" | "已啟用" | "被拒絕" | "此瀏覽器不支援";
   message: string;
 };
 
-type PermissionLevel = "status_only" | "notify" | "wake" | null;
+type WakeStatus = "idle" | "calling" | "acknowledged" | "ended" | "error";
 
 const VIEWER_CODE_STORAGE_KEY = "geoclock.web.viewerCode";
+const SHARE_POLL_INTERVAL_MS = 15_000;
 
 export default function ShareTripClient({ shareCode }: { shareCode: string }) {
-  const [state, setState] = useState<ShareState>({
-    status: "loading",
-    message: "正在讀取共享行程..."
+  const [loadState, setLoadState] = useState<ShareLoadState>({
+    initialLoading: true,
+    refreshing: false,
+    refreshError: "",
+    lastSuccessfulFetchAt: null,
+    missingMessage: "",
+    trip: null
   });
+  const mountedRef = useRef(true);
 
-  async function loadTrip(disposed = false) {
-    setState({
-      status: "loading",
-      message: "正在讀取共享行程..."
-    });
+  const loadTrip = useCallback(
+    async ({ initial = false }: { initial?: boolean } = {}) => {
+      if (!isSupabaseConfigured || !supabase) {
+        setLoadState((current) => ({
+          ...current,
+          initialLoading: false,
+          refreshing: false,
+          refreshError: "Supabase 環境變數未設定。",
+          missingMessage: current.trip ? "" : "Supabase 環境變數未設定。",
+          trip: current.trip
+        }));
+        return;
+      }
 
-    if (!isSupabaseConfigured || !supabase) {
-      setState({
-        status: "error",
-        message: "Supabase 環境變數未設定：請確認 NEXT_PUBLIC_SUPABASE_URL 與 NEXT_PUBLIC_SUPABASE_ANON_KEY。"
+      setLoadState((current) => ({
+        ...current,
+        initialLoading: initial && !current.trip,
+        refreshing: !initial,
+        refreshError: initial ? "" : current.refreshError
+      }));
+
+      const { data, error } = await supabase.from("trips").select("*").eq("share_code", shareCode).maybeSingle();
+      if (!mountedRef.current) {
+        return;
+      }
+
+      if (error) {
+        setLoadState((current) => ({
+          ...current,
+          initialLoading: false,
+          refreshing: false,
+          refreshError: `更新失敗，稍後再試：${error.message}`,
+          missingMessage: current.trip ? "" : `Supabase 查詢錯誤：${error.message}`
+        }));
+        return;
+      }
+
+      if (!data) {
+        setLoadState((current) => ({
+          ...current,
+          initialLoading: false,
+          refreshing: false,
+          refreshError: "",
+          missingMessage: `找不到行程代碼：${shareCode}。行程可能已結束，或代碼輸入錯誤。`,
+          trip: current.trip
+        }));
+        return;
+      }
+
+      setLoadState({
+        initialLoading: false,
+        refreshing: false,
+        refreshError: "",
+        lastSuccessfulFetchAt: new Date().toISOString(),
+        missingMessage: "",
+        trip: normalizeTripRow(data as CloudTripRow, shareCode)
       });
-      return;
-    }
-
-    const { data, error } = await supabase.from("trips").select("*").eq("share_code", shareCode).maybeSingle();
-    if (disposed) {
-      return;
-    }
-
-    if (error) {
-      setState({
-        status: "error",
-        message: `Supabase 查詢錯誤：${error.message}`
-      });
-      return;
-    }
-
-    if (!data) {
-      setState({
-        status: "missing",
-        message: `找不到行程代碼：${shareCode}。行程可能已結束，或代碼輸入錯誤。`
-      });
-      return;
-    }
-
-    setState({ status: "ready", trip: normalizeTripRow(data as CloudTripRow, shareCode) });
-  }
+    },
+    [shareCode]
+  );
 
   useEffect(() => {
-    let disposed = false;
-    void loadTrip(disposed);
-    const interval = window.setInterval(() => void loadTrip(disposed), 15000);
+    mountedRef.current = true;
+    void loadTrip({ initial: true });
+    const interval = window.setInterval(() => {
+      void loadTrip();
+    }, SHARE_POLL_INTERVAL_MS);
     return () => {
-      disposed = true;
+      mountedRef.current = false;
       window.clearInterval(interval);
+      stopAlertSoundLoop();
     };
-  }, [shareCode]);
+  }, [loadTrip]);
 
-  if (state.status !== "ready") {
+  if (loadState.initialLoading && !loadState.trip) {
     return (
       <main className="app-shell share-shell">
         <section className="card">
-          <p className="eyebrow">GeoClock 共享行程</p>
-          <h1>家人查看</h1>
+          <p className="eyebrow">GeoClock 家人查看</p>
+          <h1>正在讀取...</h1>
+          <p className="muted">行程代碼：{shareCode}</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (!loadState.trip) {
+    return (
+      <main className="app-shell share-shell">
+        <section className="card">
+          <p className="eyebrow">GeoClock 家人查看</p>
+          <h1>找不到共享行程</h1>
           <p className="code">行程代碼：{shareCode}</p>
-          <p className={state.status === "loading" ? "muted" : "warning"}>{state.message}</p>
-          <button className="secondary-button" onClick={() => void loadTrip()} type="button">
+          <p className="warning">{loadState.missingMessage || loadState.refreshError}</p>
+          <button className="secondary-button" onClick={() => void loadTrip({ initial: true })} type="button">
             重新載入
           </button>
         </section>
@@ -105,28 +144,48 @@ export default function ShareTripClient({ shareCode }: { shareCode: string }) {
     );
   }
 
-  return <SharedTripView onReload={() => void loadTrip()} trip={state.trip} />;
+  return (
+    <SharedTripView
+      lastSuccessfulFetchAt={loadState.lastSuccessfulFetchAt}
+      onReload={() => void loadTrip()}
+      refreshError={loadState.refreshError}
+      refreshing={loadState.refreshing}
+      trip={loadState.trip}
+    />
+  );
 }
 
-function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudTripRow }) {
-  const [wakeStatus, setWakeStatus] = useState<"idle" | "calling" | "acknowledged" | "ended" | "error">("idle");
+function SharedTripView({
+  lastSuccessfulFetchAt,
+  onReload,
+  refreshError,
+  refreshing,
+  trip
+}: {
+  lastSuccessfulFetchAt: string | null;
+  onReload: () => void;
+  refreshError: string;
+  refreshing: boolean;
+  trip: CloudTripRow;
+}) {
+  const [wakeStatus, setWakeStatus] = useState<WakeStatus>("idle");
   const [wakeMessage, setWakeMessage] = useState("這會連續推播提醒對方，最多 15 秒。");
   const [wakeCount, setWakeCount] = useState(0);
   const [wakeDetail, setWakeDetail] = useState("");
   const [notificationState, setNotificationState] = useState<ShareNotificationState>({
     status: "尚未啟用",
-    message: "啟用後，對方快到、抵達或定位中斷時，你會收到通知。"
+    message: "啟用後，對方快到、抵達或位置更新暫停時，你會收到系統通知。"
   });
   const [notificationDiagnostics, setNotificationDiagnostics] = useState<NotificationDiagnostic[]>([]);
   const [viewerCode, setViewerCode] = useState("");
-  const [permissionLevel, setPermissionLevel] = useState<PermissionLevel>(null);
-  const [permissionMessage, setPermissionMessage] = useState("未輸入家人代碼，仍可查看公開 MVP 行程。");
-  const [viewerAlertSoundStatus, setViewerAlertSoundStatus] = useState<"未解鎖" | "已解鎖" | "提醒中" | "已停止">("未解鎖");
   const [viewerTripMuted, setViewerTripMuted] = useState(false);
-  const [viewerAlertMessage, setViewerAlertMessage] = useState("提醒聲尚未啟用。");
+  const [viewerAlertSoundStatus, setViewerAlertSoundStatus] = useState<"尚未測試" | "已解鎖" | "提醒中" | "本趟已停止">("尚未測試");
+  const [viewerAlertMessage, setViewerAlertMessage] = useState("畫面開著時會響；背景只會收到系統通知。");
   const wakeRequestIdRef = useRef<string | null>(null);
   const wakeStoppedRef = useRef(false);
-  const destination: Destination = useMemo(
+  const health = getSharedHealth(trip);
+  const statusLabel = getShareStatusLabel(trip);
+  const destination = useMemo<Destination>(
     () => ({
       id: trip.share_code,
       name: trip.destination_name,
@@ -147,8 +206,6 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
           updatedAt: trip.last_location_at ?? trip.started_at
         }
       : undefined;
-  const health = getSharedHealth(trip);
-  const arrivalRadiusMeters = trip.arrival_radius_m ?? 100;
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -162,7 +219,7 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
     if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
       setNotificationState({
         status: "此瀏覽器不支援",
-        message: "此瀏覽器不支援 Web Push。iPhone 請確認已加入主畫面並從主畫面開啟。"
+        message: "此瀏覽器不支援 Web Push。iPhone 需要加入主畫面後從主畫面開啟。"
       });
       return;
     }
@@ -170,7 +227,7 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
     if (Notification.permission === "granted") {
       setNotificationState({
         status: "已啟用",
-        message: "通知權限已允許。若尚未收到通知，請重新按一次啟用家人通知。"
+        message: "通知權限已允許。如仍顯示訂閱未完成，可以再按一次啟用家人通知。"
       });
     } else if (Notification.permission === "denied") {
       setNotificationState({
@@ -181,41 +238,24 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
   }, []);
 
   useEffect(() => {
-    void loadPermission();
-  }, [trip.owner_code, viewerCode]);
+    void refreshViewerMuteStatus();
+  }, [trip.share_code, viewerCode]);
 
-  async function loadPermission() {
-    if (!viewerCode || !supabase) {
-      setPermissionLevel(null);
-      setPermissionMessage("未輸入家人代碼，仍可查看公開 MVP 行程。");
+  useEffect(() => {
+    const shouldAlert = isViewerAlertCondition(trip, health);
+    if (!shouldAlert || viewerTripMuted) {
+      stopAlertSoundLoop();
+      setViewerAlertSoundStatus(viewerTripMuted ? "本趟已停止" : "已解鎖");
       return;
     }
 
-    const { data, error } = await supabase
-      .from("permissions")
-      .select("permission_level, enabled")
-      .eq("owner_code", trip.owner_code)
-      .eq("viewer_code", viewerCode)
-      .eq("enabled", true)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      setPermissionLevel(null);
-      setPermissionMessage(`權限查詢失敗：${error.message}。仍可查看公開 MVP 行程。`);
-      return;
-    }
-
-    if (!data) {
-      setPermissionLevel(null);
-      setPermissionMessage("沒有找到家人權限，仍可查看公開 MVP 行程。");
-      return;
-    }
-
-    setPermissionLevel(data.permission_level as PermissionLevel);
-    setPermissionMessage(`已套用家人權限：${getPermissionLabel(data.permission_level)}`);
-  }
+    setViewerAlertSoundStatus("提醒中");
+    startAlertSoundLoop({
+      playMs: 5000,
+      intervalMs: 10000,
+      onError: (error) => setViewerAlertMessage(`提醒聲播放失敗：${error}`)
+    });
+  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, trip.ended_at, health, viewerTripMuted]);
 
   async function refreshViewerMuteStatus() {
     const endpoint = await getCurrentPushEndpoint();
@@ -237,9 +277,6 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       const response = await fetch(`/api/notify/mute-status?${query.toString()}`);
       const payload = (await response.json()) as { muted?: boolean };
       setViewerTripMuted(Boolean(payload.muted));
-      if (payload.muted) {
-        setViewerAlertSoundStatus("已停止");
-      }
     } catch {
       setViewerTripMuted(false);
     }
@@ -248,7 +285,7 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
   async function testViewerAlertSound() {
     const unlocked = await unlockAlertSound();
     if (!unlocked.ok) {
-      setViewerAlertMessage(unlocked.error ?? "提示音解鎖失敗。");
+      setViewerAlertMessage(unlocked.error ?? "提示音被瀏覽器阻擋，請再點一次測試提示音。");
       return;
     }
     const played = await playAlertSoundFor(5000);
@@ -257,13 +294,13 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       return;
     }
     setViewerAlertSoundStatus("已解鎖");
-    setViewerAlertMessage("提示音已解鎖。");
+    setViewerAlertMessage("提示音已解鎖。畫面開著時會響；背景只會收到系統通知。");
   }
 
   async function stopViewerTripNotifications() {
     stopAlertSoundLoop();
     setViewerTripMuted(true);
-    setViewerAlertSoundStatus("已停止");
+    setViewerAlertSoundStatus("本趟已停止");
     const endpoint = await getCurrentPushEndpoint();
 
     try {
@@ -281,49 +318,97 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
         })
       });
       const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      setViewerAlertMessage(payload.ok ? "本趟家人通知已停止。" : `停止通知失敗：${payload.error ?? "未知錯誤"}`);
+      setViewerAlertMessage(payload.ok ? "本趟通知已停止。" : `停止通知失敗：${payload.error ?? "未知錯誤"}`);
     } catch (error) {
       setViewerAlertMessage(`停止通知失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
     }
   }
 
-  useEffect(() => {
-    return () => {
-      stopAlertSoundLoop();
-    };
-  }, []);
-
-  useEffect(() => {
-    void refreshViewerMuteStatus();
-  }, [trip.share_code, viewerCode]);
-
-  useEffect(() => {
-    const shouldAlert = isViewerAlertCondition(trip, health);
-    if (!shouldAlert || viewerTripMuted) {
-      stopAlertSoundLoop();
-      if (viewerAlertSoundStatus === "提醒中") {
-        setViewerAlertSoundStatus(viewerTripMuted ? "已停止" : "已解鎖");
-      }
+  async function enableViewerNotifications() {
+    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setNotificationState({
+        status: "此瀏覽器不支援",
+        message: "此瀏覽器不支援 Web Push。iPhone Safari 需要加入主畫面後使用。"
+      });
+      setNotificationDiagnostics(await getNotificationDiagnostics(null, "此瀏覽器不支援 Web Push"));
       return;
     }
 
-    setViewerAlertSoundStatus("提醒中");
-    startAlertSoundLoop({
-      playMs: 5000,
-      intervalMs: 10000,
-      onError: (error) => setViewerAlertMessage(`提醒音播放失敗：${error}`)
-    });
-    void notifyTripEvents(trip.share_code);
-  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, health, viewerTripMuted, trip.share_code]);
+    if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) {
+      setNotificationState({
+        status: "此瀏覽器不支援",
+        message: "VAPID public key 未設定，無法啟用通知。"
+      });
+      setNotificationDiagnostics(await getNotificationDiagnostics(null, "VAPID public key 未設定"));
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      await registration.update().catch(() => undefined);
+      setNotificationDiagnostics(await getNotificationDiagnostics(null, "Service Worker 已註冊"));
+
+      const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+      if (permission === "denied") {
+        setNotificationState({
+          status: "被拒絕",
+          message: "通知權限被拒絕，請到 Safari 網站設定中允許通知。"
+        });
+        setNotificationDiagnostics(await getNotificationDiagnostics(null, "通知權限被拒絕"));
+        return;
+      }
+      if (permission !== "granted") {
+        setNotificationState({
+          status: "尚未啟用",
+          message: "尚未允許通知。請再按一次啟用家人通知。"
+        });
+        setNotificationDiagnostics(await getNotificationDiagnostics(null, "尚未允許通知"));
+        return;
+      }
+
+      const existingSubscription = await registration.pushManager.getSubscription();
+      const subscription =
+        existingSubscription ??
+        (await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
+        }));
+      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "PushSubscription 已取得"));
+
+      const response = await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          role: "viewer",
+          user_code: viewerCode || undefined,
+          share_code: trip.share_code,
+          subscription: subscription.toJSON()
+        })
+      });
+      const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+      if (!response.ok) {
+        throw new Error(payload.message ?? "Supabase 訂閱寫入失敗。");
+      }
+
+      setNotificationState({
+        status: "已啟用",
+        message: "家人通知已啟用。對方快到、抵達或位置更新暫停時，你會收到通知。"
+      });
+      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "Supabase 訂閱寫入：已寫入"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "通知設定失敗。";
+      setNotificationState({
+        status: "尚未啟用",
+        message
+      });
+      setNotificationDiagnostics(await getNotificationDiagnostics(null, message));
+    }
+  }
 
   async function callOwner() {
     if (wakeStatus === "calling") {
-      return;
-    }
-    if (permissionLevel !== "wake") {
-      setWakeStatus("error");
-      setWakeMessage("這個家人代碼尚未取得可呼叫我的權限。");
-      setWakeDetail(permissionMessage);
       return;
     }
 
@@ -340,10 +425,7 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       }
 
       const sent = await sendWakeAttempt(attempt);
-      if (!sent) {
-        break;
-      }
-      if (wakeStoppedRef.current || attempt === 5) {
+      if (!sent || wakeStoppedRef.current || attempt === 5) {
         break;
       }
 
@@ -354,9 +436,9 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       }
     }
 
-    if (!wakeStoppedRef.current) {
+    if (!wakeStoppedRef.current && wakeStatus !== "acknowledged") {
       setWakeStatus("ended");
-      setWakeMessage("呼叫結束");
+      setWakeMessage("呼叫結束。");
     }
   }
 
@@ -401,17 +483,17 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       }
       if (payload.status === "acknowledged") {
         setWakeStatus("acknowledged");
-        setWakeMessage("對方已回應");
+        setWakeMessage("對方已回應。");
         wakeStoppedRef.current = true;
         return false;
       }
 
       setWakeCount(attempt);
-      setWakeMessage(`呼叫中，已送出第 ${attempt} 次提醒`);
+      setWakeMessage(`呼叫中，已送出第 ${attempt} 次提醒。`);
       return true;
-    } catch {
+    } catch (error) {
       setWakeStatus("error");
-      setWakeMessage("呼叫失敗，請稍後再試。");
+      setWakeMessage(`呼叫失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
       wakeStoppedRef.current = true;
       return false;
     }
@@ -424,12 +506,10 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
 
     try {
       const response = await fetch(`/api/wake/status?id=${encodeURIComponent(wakeRequestIdRef.current)}`);
-      const payload = (await response.json()) as {
-        status?: string;
-      };
+      const payload = (await response.json()) as { status?: string };
       if (payload.status === "acknowledged") {
         setWakeStatus("acknowledged");
-        setWakeMessage("對方已回應");
+        setWakeMessage("對方已回應。");
         wakeStoppedRef.current = true;
         return true;
       }
@@ -440,95 +520,17 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
     return false;
   }
 
-  async function enableViewerNotifications() {
-    setNotificationDiagnostics(await getNotificationDiagnostics());
-    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
-      setNotificationState({
-        status: "此瀏覽器不支援",
-        message: "此瀏覽器不支援 Web Push。iPhone 請確認已加入主畫面並從主畫面開啟。"
-      });
-      return;
-    }
-
-    if (!isStandaloneMode()) {
-      setNotificationState({
-        status: "尚未啟用",
-        message: "iPhone 請先分享 → 加入主畫面，再從主畫面開啟 GeoClock 啟用通知。"
-      });
-    }
-
-    if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) {
-      setNotificationState({
-        status: "此瀏覽器不支援",
-        message: "尚未設定 VAPID public key，無法啟用通知。"
-      });
-      return;
-    }
-
-    const permission = await Notification.requestPermission();
-    if (permission === "denied") {
-      setNotificationState({
-        status: "被拒絕",
-        message: "通知權限被拒絕，請到 Safari 網站設定中允許通知。"
-      });
-      return;
-    }
-    if (permission !== "granted") {
-      setNotificationState({
-        status: "尚未啟用",
-        message: "尚未允許通知。"
-      });
-      return;
-    }
-
-    try {
-      const registration = await navigator.serviceWorker.register("/sw.js");
-      const subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
-      });
-      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "尚未寫入"));
-
-      const response = await fetch("/api/push/subscribe", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          userCode: viewerCode || undefined,
-          shareCode: trip.share_code,
-          role: "viewer",
-          subscription: subscription.toJSON()
-        })
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as { message?: string };
-        throw new Error(payload.message ?? "通知訂閱寫入 Supabase 失敗");
-      }
-
-      setNotificationState({
-        status: "已啟用",
-        message: "家人通知已啟用。對方快到、抵達或定位中斷時，你會收到通知。"
-      });
-      setNotificationDiagnostics(await getNotificationDiagnostics(subscription, "成功"));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "通知訂閱失敗";
-      setNotificationState({
-        status: "尚未啟用",
-        message: `通知訂閱失敗：${message}`
-      });
-      setNotificationDiagnostics(await getNotificationDiagnostics(null, message));
-    }
-  }
-
   return (
     <main className="app-shell share-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">GeoClock 共享行程</p>
-          <h1>家人查看</h1>
-          <p className="code">行程代碼：{trip.share_code}</p>
+          <p className="eyebrow">GeoClock 家人查看</p>
+          <h1>{statusLabel}</h1>
+          <p className="muted">行程代碼：{trip.share_code}</p>
+          <p className="field-hint">
+            {refreshing ? "更新中..." : lastSuccessfulFetchAt ? `最後更新：${formatTime(lastSuccessfulFetchAt)}` : "尚未更新"}
+          </p>
+          {refreshError ? <p className="field-hint warning">{refreshError}</p> : null}
         </div>
         <button className="secondary-button small-button" onClick={onReload} type="button">
           重新載入
@@ -536,9 +538,71 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
       </header>
 
       <section className="card">
+        <p className="eyebrow">行程狀態</p>
         <div className="status-grid">
-          <Metric label="行程代碼" value={trip.share_code} />
-          <Metric label="我的家人代碼" value={viewerCode || "尚未取得"} />
+          <Metric label="狀態" value={statusLabel} />
+          <Metric label="目的地" value={trip.destination_name} />
+          <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
+          <Metric label="最後位置更新" value={formatDateTime(trip.last_location_at)} />
+          <Metric label="快到提醒距離" value={formatDistance(trip.alert_radius_m)} />
+          <Metric label="已抵達判斷距離" value={formatDistance(trip.arrival_radius_m ?? 100)} />
+        </div>
+      </section>
+
+      <section className="journey-panel active">
+        <div>
+          <p className="eyebrow">粗略位置</p>
+          <h2>{trip.destination_name}</h2>
+          <p className="muted">此頁顯示的是粗略位置，非精準定位。</p>
+        </div>
+        <div className="map-block">
+          <TripMap currentPosition={currentPosition} destination={destination} radiusMeters={trip.alert_radius_m} />
+          <div className="map-summary">
+            <Metric label="目前位置最後更新" value={formatDateTime(trip.last_location_at)} />
+            <Metric label="目的地" value={trip.destination_name} />
+            <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
+          </div>
+        </div>
+      </section>
+
+      <section className="card cloud-share-card">
+        <p className="eyebrow">操作</p>
+        <div className="status-grid">
+          <Metric label="家人通知" value={notificationState.status} />
+          <Metric label="提醒聲" value={viewerAlertSoundStatus} />
+          <Metric label="本趟通知" value={viewerTripMuted ? "已停止" : "啟用中"} />
+        </div>
+        <p className="notice">通知功能需將網站加入 iPhone 主畫面後使用。Web Push 不是原生鬧鐘，不能保證無視靜音。</p>
+        <p className="muted">{getStandaloneHint()}</p>
+        <p className={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援" ? "warning" : "muted"}>
+          {notificationState.message}
+        </p>
+        <p className={viewerTripMuted ? "good" : "muted"}>{viewerAlertMessage}</p>
+        <div className="trip-actions">
+          <button className="primary-button" onClick={enableViewerNotifications} type="button">
+            啟用家人通知
+          </button>
+          <button className="secondary-button" onClick={testViewerAlertSound} type="button">
+            測試提醒聲
+          </button>
+          <button className="secondary-button" disabled={wakeStatus === "calling" || Boolean(trip.ended_at)} onClick={callOwner} type="button">
+            呼叫對方
+          </button>
+          <button className="secondary-button" disabled={viewerTripMuted} onClick={stopViewerTripNotifications} type="button">
+            收到，停止本趟通知
+          </button>
+        </div>
+        <p className={wakeStatus === "error" ? "warning" : "muted"}>{wakeMessage}</p>
+        {wakeStatus === "calling" ? <p className="muted">已送出第 {wakeCount} 次提醒。</p> : null}
+        {wakeDetail ? <p className="field-hint">{wakeDetail}</p> : null}
+      </section>
+
+      <details className="card advanced-settings">
+        <summary>進階診斷</summary>
+        <div className="diagnostic-summary">
+          <p className="muted">
+            {notificationState.status === "已啟用" ? "通知設定完成。" : "通知尚未完成設定，點開查看原因。"}
+          </p>
         </div>
         <label>
           我的家人代碼
@@ -549,91 +613,11 @@ function SharedTripView({ onReload, trip }: { onReload: () => void; trip: CloudT
               setViewerCode(nextCode);
               window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, nextCode);
             }}
-            placeholder="例如：FAMILY-1234"
+            placeholder="例如 FAMILY-1234"
           />
         </label>
-        <p className="muted">{permissionMessage}</p>
-        <p className="notice">此頁顯示的是粗略位置，非精準定位。</p>
-        <p className="notice">這會連續推播提醒對方，最多 15 秒。</p>
-        {health === "中斷" && !trip.ended_at ? <p className="warning">定位可能中斷</p> : null}
-        <div className="status-grid">
-          <Metric label="行程狀態" value={trip.ended_at ? "已結束" : trip.status} />
-          <Metric label="目的地" value={trip.destination_name} />
-          <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
-          <Metric label="最後更新時間" value={formatDateTime(trip.last_location_at)} />
-          <Metric label="定位健康度" value={trip.ended_at ? "已結束" : health === "中斷" ? "定位可能中斷" : health} />
-          <Metric label="快到提醒距離" value={formatDistance(trip.alert_radius_m)} />
-          <Metric label="已抵達判斷距離" value={formatDistance(arrivalRadiusMeters)} />
-        </div>
-      </section>
-
-      <section className="card cloud-share-card">
-        <p className="eyebrow">家人提醒</p>
-        <div className="status-grid">
-          <Metric label="提醒聲狀態" value={viewerAlertSoundStatus} />
-          <Metric label="本趟家人通知" value={viewerTripMuted ? "已停止" : "啟用中"} />
-        </div>
-        <p className="notice">分享頁開著時會每 10 秒檢查一次，符合條件時每次響約 5 秒。</p>
-        <p className="muted">背景或鎖屏時只能依賴系統通知聲。</p>
-        <p className={viewerTripMuted ? "good" : "muted"}>{viewerAlertMessage}</p>
-        <div className="trip-actions">
-          <button className="secondary-button" onClick={testViewerAlertSound} type="button">
-            測試提示音
-          </button>
-          <button className="primary-button" disabled={viewerTripMuted} onClick={stopViewerTripNotifications} type="button">
-            收到，停止本趟通知
-          </button>
-        </div>
-      </section>
-
-      <section className="card cloud-share-card">
-        <p className="eyebrow">家人通知</p>
-        <h2>{notificationState.status}</h2>
-        <p className="notice">啟用後，對方快到、抵達或定位中斷時，你會收到通知。</p>
-        <p className="muted">{getStandaloneHint()}</p>
-        <p className={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援" ? "warning" : "muted"}>
-          {notificationState.message}
-        </p>
-        <button
-          className="primary-button"
-          disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"}
-          onClick={enableViewerNotifications}
-          type="button"
-        >
-          啟用家人通知
-        </button>
         <DiagnosticList items={notificationDiagnostics} />
-      </section>
-
-      <section className="card cloud-share-card">
-        <p className="eyebrow">呼叫提醒</p>
-        <h2>{wakeStatus === "calling" ? "呼叫中" : wakeStatus === "acknowledged" ? "對方已回應" : "呼叫對方"}</h2>
-        <p className={wakeStatus === "error" ? "warning" : "muted"}>{wakeMessage}</p>
-        {permissionLevel !== "wake" ? <p className="warning">需要「可呼叫我」權限才可以呼叫對方。</p> : null}
-        {wakeDetail ? <p className="field-hint">{wakeDetail}</p> : null}
-        {wakeStatus === "calling" ? <p className="muted">已送出第 {wakeCount} 次提醒</p> : null}
-        <button className="primary-button" disabled={wakeStatus === "calling" || Boolean(trip.ended_at)} onClick={callOwner} type="button">
-          呼叫對方
-        </button>
-      </section>
-
-      <section className="journey-panel active">
-        <div>
-          <p className="eyebrow">粗略位置地圖</p>
-          <h2>{trip.ended_at ? "已結束" : trip.status}</h2>
-          <p className="journey-destination">{trip.destination_name}</p>
-        </div>
-        <div className="map-block">
-          <TripMap currentPosition={currentPosition} destination={destination} radiusMeters={trip.alert_radius_m} />
-          <div className="map-summary">
-            <Metric label="目前位置最後更新" value={formatDateTime(trip.last_location_at)} />
-            <Metric label="目的地" value={trip.destination_name} />
-            <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
-            <Metric label="快到提醒距離" value={formatDistance(trip.alert_radius_m)} />
-            <Metric label="已抵達判斷距離" value={formatDistance(arrivalRadiusMeters)} />
-          </div>
-        </div>
-      </section>
+      </details>
     </main>
   );
 }
@@ -657,22 +641,6 @@ function DiagnosticList({ items }: { items: NotificationDiagnostic[] }) {
       ))}
     </div>
   );
-}
-
-async function notifyTripEvents(shareCode: string) {
-  try {
-    await fetch("/api/notify/trip-events", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        shareCode
-      })
-    });
-  } catch {
-    // 自動通知檢查失敗不應影響家人查看頁。
-  }
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -712,33 +680,53 @@ function createFamilyViewerCode() {
   return `FAMILY-${Math.floor(1000 + Math.random() * 9000)}`;
 }
 
-function getPermissionLabel(permission: string) {
-  if (permission === "status_only") {
-    return "只看狀態";
-  }
-  if (permission === "notify") {
-    return "接收到站通知";
-  }
-  if (permission === "wake") {
-    return "可呼叫我";
-  }
-  return permission;
-}
-
 function formatWakeDiagnostics(diagnostics: { ownerSubscriptions: number; pushSuccess: number; pushFailed: number; errors: string[] }) {
-  const errorText = diagnostics.errors.length > 0 ? `，原因：${diagnostics.errors.join("；")}` : "";
-  return `找到 ${diagnostics.ownerSubscriptions} 個本人通知訂閱，成功送出 ${diagnostics.pushSuccess} 個，失敗 ${diagnostics.pushFailed} 個${errorText}`;
+  const errorText = diagnostics.errors.length > 0 ? `，原因：${diagnostics.errors.join("、")}` : "";
+  return `找到 ${diagnostics.ownerSubscriptions} 個對方通知訂閱，成功 ${diagnostics.pushSuccess} 個，失敗 ${diagnostics.pushFailed} 個${errorText}`;
 }
 
-function getSharedHealth(trip: CloudTripRow): LocationHealth {
-  if (trip.ended_at) {
-    return "正常";
+function getSharedHealth(trip: CloudTripRow) {
+  if (trip.ended_at || trip.status === "ended") {
+    return "ended";
   }
-  return getLocationHealth(trip.last_location_at ?? undefined);
+  if (!trip.last_location_at) {
+    return "unknown";
+  }
+  const ageMs = Date.now() - new Date(trip.last_location_at).getTime();
+  if (Number.isNaN(ageMs)) {
+    return "unknown";
+  }
+  if (ageMs > 30 * 60 * 1000) {
+    return "expired";
+  }
+  if (ageMs > 5 * 60 * 1000) {
+    return "lost";
+  }
+  if (ageMs > 60 * 1000) {
+    return "paused";
+  }
+  return "ok";
 }
 
-function isViewerAlertCondition(trip: CloudTripRow, health: LocationHealth) {
-  if (trip.ended_at) {
+function getShareStatusLabel(trip: CloudTripRow) {
+  const health = getSharedHealth(trip);
+  if (health === "ended") {
+    return "行程已結束";
+  }
+  if (health === "expired") {
+    return "行程可能已失效";
+  }
+  if (health === "lost") {
+    return "定位可能中斷";
+  }
+  if (health === "paused") {
+    return "位置更新暫停";
+  }
+  return trip.status || "行程中";
+}
+
+function isViewerAlertCondition(trip: CloudTripRow, health: string) {
+  if (trip.ended_at || trip.status === "ended") {
     return false;
   }
   const arrivalRadiusMeters = trip.arrival_radius_m ?? 100;
@@ -748,7 +736,7 @@ function isViewerAlertCondition(trip: CloudTripRow, health: LocationHealth) {
   if (typeof trip.distance_m === "number" && trip.distance_m <= arrivalRadiusMeters) {
     return true;
   }
-  return health === "中斷";
+  return health === "paused" || health === "lost";
 }
 
 async function getCurrentPushEndpoint() {
@@ -767,6 +755,14 @@ function formatDateTime(value: string | null) {
   return new Intl.DateTimeFormat("zh-TW", {
     month: "2-digit",
     day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(new Date(value));
+}
+
+function formatTime(value: string) {
+  return new Intl.DateTimeFormat("zh-TW", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit"

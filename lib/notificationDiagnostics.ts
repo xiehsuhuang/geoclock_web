@@ -1,12 +1,17 @@
 import type { NotificationDiagnostic } from "./types";
 
-export async function getNotificationDiagnostics(subscription?: PushSubscription | null, supabaseWrite?: string): Promise<NotificationDiagnostic[]> {
+export async function getNotificationDiagnostics(
+  subscription?: PushSubscription | null,
+  supabaseWrite?: string
+): Promise<NotificationDiagnostic[]> {
   const hasWindow = typeof window !== "undefined";
   const serviceWorkerSupported = hasWindow && "serviceWorker" in navigator;
   const pushSupported = hasWindow && "PushManager" in window;
   const notificationSupported = hasWindow && "Notification" in window;
   const isHttps = hasWindow && (window.location.protocol === "https:" || window.location.hostname === "localhost");
   const registration = serviceWorkerSupported ? await navigator.serviceWorker.getRegistration().catch(() => undefined) : undefined;
+  const activeSubscription =
+    subscription ?? (registration ? await registration.pushManager.getSubscription().catch(() => null) : null);
 
   return [
     {
@@ -25,7 +30,7 @@ export async function getNotificationDiagnostics(subscription?: PushSubscription
       ok: notificationSupported && Notification.permission === "granted"
     },
     {
-      label: "HTTPS 狀態",
+      label: "HTTPS",
       value: isHttps ? "可用" : "目前不是 HTTPS",
       ok: isHttps
     },
@@ -36,19 +41,19 @@ export async function getNotificationDiagnostics(subscription?: PushSubscription
     },
     {
       label: "PushSubscription",
-      value: subscription ? "已取得" : "尚未取得",
-      ok: Boolean(subscription)
+      value: activeSubscription ? "已取得" : "尚未取得",
+      ok: Boolean(activeSubscription)
     },
     {
       label: "Supabase 訂閱寫入",
       value: supabaseWrite ?? "尚未寫入",
-      ok: supabaseWrite === "成功"
+      ok: supabaseWrite === "Supabase 訂閱寫入：已寫入" || supabaseWrite === "已寫入" || supabaseWrite === "成功"
     }
   ];
 }
 
 export function getStandaloneHint() {
-  return "iPhone 必須先用 Safari 加入主畫面，並從主畫面打開 GeoClock。直接在 Safari 分頁中可能無法啟用 Web Push；Web Push 不是原生鬧鐘，不能保證無視靜音。";
+  return "iPhone 必須先用 Safari 加入主畫面，並從主畫面打開 GeoClock 才能使用 Web Push。直接在 Safari 分頁中可能無法啟用通知；Web Push 不是原生鬧鐘，不能保證無視靜音。";
 }
 
 export function isStandaloneMode() {

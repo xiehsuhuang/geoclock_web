@@ -257,6 +257,7 @@ export default function Home() {
     status: "idle",
     message: ""
   });
+  const lastNotifyAttemptRef = useRef(0);
   const wakeToneIntervalRef = useRef<number | null>(null);
   const wakeToneTimeoutRef = useRef<number | null>(null);
 
@@ -1306,7 +1307,9 @@ export default function Home() {
       ...current,
       message: "雲端行程已同步"
     }));
-    if (!ownerTripMuted) {
+    const now = Date.now();
+    if (!ownerTripMuted && now - lastNotifyAttemptRef.current > 60_000) {
+      lastNotifyAttemptRef.current = now;
       void notifyTripEvents(share.tripId, share.shareCode);
     }
   }
@@ -1371,7 +1374,7 @@ export default function Home() {
     const { error } = await supabase
       .from("trips")
       .update({
-        status,
+        status: "ended",
         ended_at: new Date().toISOString()
       })
       .eq("id", share.tripId);
@@ -1384,6 +1387,7 @@ export default function Home() {
     appendEvent("停止家人共享", "雲端共享行程已標記結束");
     if (share.shareCode) {
       void notifyFamilyTripEvent(share.shareCode, "trip_ended");
+      void stopOwnerTripNotifications();
     }
   }
 
@@ -1799,7 +1803,13 @@ export default function Home() {
           <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={enableNotifications} type="button">
             啟用通知
           </button>
-          <DiagnosticList items={notificationDiagnostics} />
+          <details className="advanced-settings">
+            <summary>進階診斷</summary>
+            <p className="field-hint">
+              {notificationState.status === "已啟用" ? "通知設定完成。" : "通知尚未完成設定，點開查看原因。"}
+            </p>
+            <DiagnosticList items={notificationDiagnostics} />
+          </details>
         </article>
 
         <article className="card">

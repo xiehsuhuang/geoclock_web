@@ -4,6 +4,8 @@ import { supabase } from "@/lib/supabaseClient";
 type PushSubscriptionPayload = {
   userCode?: string;
   shareCode?: string;
+  user_code?: string;
+  share_code?: string;
   role?: "owner" | "viewer";
   subscription?: {
     endpoint?: string;
@@ -20,8 +22,8 @@ export async function POST(request: Request) {
   }
 
   const payload = (await request.json()) as PushSubscriptionPayload;
-  const userCode = payload.userCode?.trim();
-  const shareCode = payload.shareCode?.trim();
+  const userCode = (payload.userCode ?? payload.user_code)?.trim();
+  const shareCode = (payload.shareCode ?? payload.share_code)?.trim();
   const role = payload.role === "viewer" ? "viewer" : "owner";
   const endpoint = payload.subscription?.endpoint;
   const p256dh = payload.subscription?.keys?.p256dh;
