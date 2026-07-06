@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   destinationKey,
   formatDistance,
@@ -46,10 +46,18 @@ const RADIUS_OPTIONS = [
 ];
 
 const ARRIVAL_RADIUS_OPTIONS = [50, 100, 200, 300];
+const TRIP_DURATION_OPTIONS = [
+  { label: "30 分鐘", value: 30 },
+  { label: "1 小時", value: 60 },
+  { label: "2 小時", value: 120 },
+  { label: "3 小時", value: 180 }
+];
 const DEFAULT_ARRIVAL_RADIUS_METERS = 100;
+const DEFAULT_TRIP_DURATION_MINUTES = 120;
 const MIN_ALERT_RADIUS_METERS = 50;
 const MAX_ALERT_RADIUS_METERS = 10000;
 const VIEWER_CODE_STORAGE_KEY = "geoclock.web.viewerCode";
+const NOTIFICATION_CENTER_STORAGE_KEY = "geoclock.web.notificationCenter";
 const MILESTONE_METERS = [5000, 2000, 1000, 500, 300];
 const PERMISSIONS: { label: string; value: FamilyPermission }[] = [
   { label: "只看狀態", value: "status_only" },
@@ -135,6 +143,7 @@ type CloudShareState = {
   tripId?: string;
   shareCode?: string;
   shareUrl?: string;
+  expiresAt?: string;
 };
 
 type HomeMode = "start" | "view" | "family";
@@ -177,6 +186,19 @@ type NotificationState = {
   message: string;
 };
 
+type NotificationCenterItem = {
+  id: string;
+  type: string;
+  time: string;
+  success: boolean;
+  error?: string | null;
+  shareCode?: string | null;
+  recipientCode?: string | null;
+  read?: boolean;
+};
+
+type SidebarSection = "preflight" | "notifications" | "family" | "testMode" | "notificationCenter" | "diagnostics" | null;
+
 const emptyDestinationForm: DestinationFormState = {
   name: "",
   address: "",
@@ -189,6 +211,8 @@ const emptyDestinationForm: DestinationFormState = {
 export default function Home() {
   const [hydrated, setHydrated] = useState(false);
   const [homeMode, setHomeMode] = useState<HomeMode>("start");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>(null);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [nicknameInput, setNicknameInput] = useState("");
   const [destinations, setDestinations] = useState<Destination[]>([]);
@@ -200,11 +224,17 @@ export default function Home() {
     message: ""
   });
   const [placeCandidates, setPlaceCandidates] = useState<PlaceSearchCandidate[]>([]);
+  const [showAllPlaceCandidates, setShowAllPlaceCandidates] = useState(false);
   const [selectedDestinationId, setSelectedDestinationId] = useState("");
   const [radiusMeters, setRadiusMeters] = useState(DEFAULT_TRIP_SETTINGS.alertRadiusMeters);
   const [customRadiusInput, setCustomRadiusInput] = useState("");
   const [radiusNotice, setRadiusNotice] = useState("");
   const [arrivalRadiusMeters, setArrivalRadiusMeters] = useState(DEFAULT_TRIP_SETTINGS.arrivalRadiusMeters);
+  const [tripDurationMinutes, setTripDurationMinutes] = useState(DEFAULT_TRIP_DURATION_MINUTES);
+  const [customTripDurationInput, setCustomTripDurationInput] = useState("");
+  const [selectedTripRecipients, setSelectedTripRecipients] = useState<string[]>([]);
+  const [familyPushEnabledCodes, setFamilyPushEnabledCodes] = useState<Set<string>>(new Set());
+  const [existingCloudTrip, setExistingCloudTrip] = useState<FamilyTripRow | null>(null);
   const [activeTrip, setActiveTrip] = useState<ActiveTrip | null>(null);
   const [family, setFamily] = useState<FamilyMember[]>([]);
   const [familyCode, setFamilyCode] = useState("");
@@ -219,6 +249,7 @@ export default function Home() {
   const [viewerShareCode, setViewerShareCode] = useState("");
   const [viewerCodeInput, setViewerCodeInput] = useState("");
   const [viewerEntryMessage, setViewerEntryMessage] = useState("");
+  const [manualViewerOpen, setManualViewerOpen] = useState(false);
   const [privacySettings, setPrivacySettings] = useState<PrivacySettings>(DEFAULT_PRIVACY_SETTINGS);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [wakeLockStatus, setWakeLockStatus] = useState("尚未啟用");
@@ -235,6 +266,9 @@ export default function Home() {
     message: "通知功能需將網站加入 iPhone 主畫面後使用。"
   });
   const [notificationDiagnostics, setNotificationDiagnostics] = useState<NotificationDiagnostic[]>([]);
+  const [notificationCenterItems, setNotificationCenterItems] = useState<NotificationCenterItem[]>([]);
+  const [notificationCenterMessage, setNotificationCenterMessage] = useState("");
+  const [testModeMessage, setTestModeMessage] = useState("");
   const [activeWakeRequest, setActiveWakeRequest] = useState<WakeRequestRow | null>(null);
   const [wakeToneActive, setWakeToneActive] = useState(false);
   const [eventsExpanded, setEventsExpanded] = useState(false);
@@ -246,6 +280,7 @@ export default function Home() {
   const [audioCheck, setAudioCheck] = useState<PreflightCheckState>(initialAudioCheck);
   const [vibrationCheck, setVibrationCheck] = useState<PreflightCheckState>(initialVibrationCheck);
   const [wakeLockCheck, setWakeLockCheck] = useState<PreflightCheckState>(initialWakeLockCheck);
+  const [foregroundLocationMessage, setForegroundLocationMessage] = useState("");
 
   const watchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
@@ -257,6 +292,7 @@ export default function Home() {
     status: "idle",
     message: ""
   });
+  const autoCloudShareStartedRef = useRef(false);
   const lastNotifyAttemptRef = useRef(0);
   const wakeToneIntervalRef = useRef<number | null>(null);
   const wakeToneTimeoutRef = useRef<number | null>(null);
@@ -287,6 +323,28 @@ export default function Home() {
     vibrationCheck.status !== "尚未測試" &&
     wakeLockCheck.status !== "尚未測試";
   const preflightCanStart = preflightChecksAttempted && locationCheck.status === "成功";
+  const activeFamilyConnectionsCount = familyConnections.filter((connection) => connection.status === "confirmed").length;
+  const confirmedFamilyOptions = useMemo(() => {
+    if (!user) {
+      return [];
+    }
+    return familyConnections
+      .filter((connection) => connection.status === "confirmed")
+      .map((connection) => {
+        const code = connection.user_a_code === user.code ? connection.user_b_code : connection.user_a_code;
+        const permissions = connection.user_a_code === user.code ? connection.user_b_permissions : connection.user_a_permissions;
+        return {
+          code,
+          permissions: permissions ?? {}
+        };
+      });
+  }, [familyConnections, user]);
+  const preflightBadge = getPreflightSummaryLabel(preflightResults);
+  const diagnosticsWarningCount = notificationDiagnostics.filter((item) => !item.ok).length;
+  const notificationBadge = notificationState.status === "已啟用" ? "通知：已啟用" : "通知：未啟用";
+  const soundBadge = audioCheck.status === "成功" || tripAlertSoundStatus === "已解鎖" ? "提示聲：已解鎖" : "提示聲：未解鎖";
+  const locationBadge = activeTrip ? getPublicLocationStatus(activeTrip.lastPosition?.updatedAt) : "定位：未開始";
+  const notificationUnreadCount = notificationCenterItems.filter((item) => !item.read).length;
 
   useEffect(() => {
     const snapshot = loadSnapshot();
@@ -298,6 +356,16 @@ export default function Home() {
     setRadiusMeters(snapshot.tripSettings.alertRadiusMeters);
     setArrivalRadiusMeters(getSafeArrivalRadius(snapshot.tripSettings.arrivalRadiusMeters, snapshot.tripSettings.alertRadiusMeters));
     setSelectedDestinationId(snapshot.destinations[0]?.id ?? "");
+    if (typeof window !== "undefined") {
+      try {
+        const rawNotifications = window.localStorage.getItem(NOTIFICATION_CENTER_STORAGE_KEY);
+        if (rawNotifications) {
+          setNotificationCenterItems(JSON.parse(rawNotifications) as NotificationCenterItem[]);
+        }
+      } catch {
+        setNotificationCenterItems([]);
+      }
+    }
     setHydrated(true);
   }, []);
 
@@ -312,9 +380,9 @@ export default function Home() {
       return;
     }
     const existingViewerCode = window.localStorage.getItem(VIEWER_CODE_STORAGE_KEY);
-    const nextViewerCode = existingViewerCode || createFamilyViewerCode();
-    window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, nextViewerCode);
-    setViewerCodeInput(nextViewerCode);
+    if (!existingViewerCode) {
+      window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, createFamilyViewerCode());
+    }
   }, [hydrated]);
 
   useEffect(() => {
@@ -326,6 +394,42 @@ export default function Home() {
     void loadFamilyConnections(user.code);
     void loadFamilyTrips(user.code);
   }, [user]);
+
+  useEffect(() => {
+    setSelectedTripRecipients((current) => {
+      const validCodes = new Set(confirmedFamilyOptions.map((option) => option.code));
+      const kept = current.filter((code) => validCodes.has(code));
+      const defaults = confirmedFamilyOptions
+        .filter((option) => option.permissions.can_receive_notifications === true)
+        .map((option) => option.code);
+      return Array.from(new Set([...kept, ...defaults]));
+    });
+  }, [confirmedFamilyOptions]);
+
+  useEffect(() => {
+    if (!supabase || confirmedFamilyOptions.length === 0) {
+      setFamilyPushEnabledCodes(new Set());
+      return;
+    }
+
+    let disposed = false;
+    const codes = confirmedFamilyOptions.map((option) => option.code);
+    async function loadPushEnabledCodes() {
+      const { data } = await supabase!
+        .from("push_subscriptions")
+        .select("user_code")
+        .in("user_code", codes);
+      if (disposed) {
+        return;
+      }
+      setFamilyPushEnabledCodes(new Set(((data ?? []) as { user_code: string | null }[]).map((row) => row.user_code).filter(Boolean) as string[]));
+    }
+
+    void loadPushEnabledCodes();
+    return () => {
+      disposed = true;
+    };
+  }, [confirmedFamilyOptions]);
 
   useEffect(() => {
     if (!hydrated) {
@@ -382,6 +486,12 @@ export default function Home() {
 
   useEffect(() => {
     if (hydrated) {
+      window.localStorage.setItem(NOTIFICATION_CENTER_STORAGE_KEY, JSON.stringify(notificationCenterItems.slice(0, 100)));
+    }
+  }, [hydrated, notificationCenterItems]);
+
+  useEffect(() => {
+    if (hydrated) {
       writeStored(STORAGE_KEYS.privacy, privacySettings);
     }
   }, [hydrated, privacySettings]);
@@ -398,6 +508,14 @@ export default function Home() {
   useEffect(() => {
     cloudShareRef.current = cloudShare;
   }, [cloudShare]);
+
+  useEffect(() => {
+    if (!activeTrip || autoCloudShareStartedRef.current || cloudShare.status !== "idle") {
+      return;
+    }
+    autoCloudShareStartedRef.current = true;
+    void enableCloudSharing();
+  }, [activeTrip, cloudShare.status]);
 
   useEffect(() => {
     if (!activeTrip) {
@@ -434,6 +552,35 @@ export default function Home() {
       onError: (error) => setAudioStatus(`提醒音播放失敗：${error}`)
     });
   }, [activeTrip?.distanceMeters, activeTrip?.radiusMeters, activeTrip?.arrivalRadiusMeters, activeTrip?.status, ownerTripMuted]);
+
+  useEffect(() => {
+    if (!activeTrip || !("geolocation" in navigator)) {
+      return;
+    }
+
+    function refreshPositionWhenVisible() {
+      if (document.visibilityState !== "visible" || !activeTrip) {
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          handlePositionUpdate(position, activeTrip.destination, activeTrip.radiusMeters, activeTrip.arrivalRadiusMeters);
+          setForegroundLocationMessage("剛剛已重新取得位置。");
+        },
+        (error) => {
+          setForegroundLocationMessage(getGeolocationFailureMessage(error));
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 10_000,
+          timeout: 15_000
+        }
+      );
+    }
+
+    document.addEventListener("visibilitychange", refreshPositionWhenVisible);
+    return () => document.removeEventListener("visibilitychange", refreshPositionWhenVisible);
+  }, [activeTrip]);
 
   useEffect(() => {
     return () => {
@@ -492,6 +639,82 @@ export default function Home() {
 
   function appendEvent(type: EventType, message: string) {
     setEvents((current) => [createEvent(type, message), ...current].slice(0, 100));
+    if (isNotificationCenterEvent(type)) {
+      appendNotificationCenterItem({
+        type,
+        success: !message.includes("失敗"),
+        error: message.includes("失敗") ? message : null,
+        shareCode: cloudShareRef.current.shareCode ?? null,
+        recipientCode: null
+      });
+    }
+  }
+
+  function appendNotificationCenterItem(item: Omit<NotificationCenterItem, "id" | "time" | "read">) {
+    setNotificationCenterItems((current) => [
+      {
+        id: createId("notification"),
+        time: new Date().toISOString(),
+        read: false,
+        ...item
+      },
+      ...current
+    ].slice(0, 100));
+  }
+
+  async function loadNotificationCenter() {
+    if (!supabase) {
+      setNotificationCenterMessage("Supabase 未設定，已顯示本機通知紀錄。");
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from("notification_events")
+        .select("id,event_type,sent_at,created_at,success,error,share_code,recipient_code")
+        .order("sent_at", { ascending: false })
+        .limit(50);
+      if (error) {
+        setNotificationCenterMessage(`通知中心讀取失敗：${error.message}`);
+        return;
+      }
+
+      setNotificationCenterItems(
+        ((data ?? []) as {
+          id: string;
+          event_type: string | null;
+          sent_at: string | null;
+          created_at: string | null;
+          success: boolean | null;
+          error: string | null;
+          share_code: string | null;
+          recipient_code: string | null;
+        }[]).map((row) => ({
+          id: row.id,
+          type: row.event_type ?? "通知事件",
+          time: row.sent_at ?? row.created_at ?? new Date().toISOString(),
+          success: row.success !== false,
+          error: row.error,
+          shareCode: row.share_code,
+          recipientCode: row.recipient_code,
+          read: notificationCenterItems.find((item) => item.id === row.id)?.read ?? false
+        }))
+      );
+      setNotificationCenterMessage("通知中心已重新載入。");
+    } catch (error) {
+      setNotificationCenterMessage(`通知中心讀取失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
+    }
+  }
+
+  function markNotificationCenterRead() {
+    setNotificationCenterItems((current) => current.map((item) => ({ ...item, read: true })));
+    setNotificationCenterMessage("已全部標記已讀。");
+  }
+
+  function clearLocalNotificationCenter() {
+    setNotificationCenterItems([]);
+    window.localStorage.removeItem(NOTIFICATION_CENTER_STORAGE_KEY);
+    setNotificationCenterMessage("已清除本機通知紀錄。");
   }
 
   function appendStatusEventOnce(type: EventType, message: string) {
@@ -634,6 +857,7 @@ export default function Home() {
     });
     setDestinationForm(emptyDestinationForm);
     setPlaceCandidates([]);
+    setShowAllPlaceCandidates(false);
     setPlaceSearchState({ status: "idle", message: "" });
   }
 
@@ -646,6 +870,7 @@ export default function Home() {
 
     setPlaceSearchState({ status: "loading", message: "搜尋中..." });
     setPlaceCandidates([]);
+    setShowAllPlaceCandidates(false);
 
     try {
       const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
@@ -672,6 +897,7 @@ export default function Home() {
       }
 
       setPlaceCandidates(results);
+      setShowAllPlaceCandidates(false);
       setPlaceSearchState({ status: "success", message: "請選擇最接近的地點。" });
     } catch {
       setPlaceSearchState({
@@ -692,6 +918,7 @@ export default function Home() {
     }));
     setDestinationNotice("已取得目的地定位");
     setPlaceSearchState({ status: "success", message: "已取得目的地定位" });
+    setShowAllPlaceCandidates(false);
   }
 
   function selectDestination(destination: Destination) {
@@ -705,6 +932,7 @@ export default function Home() {
       locationSource: "none"
     });
     setPlaceCandidates([]);
+    setShowAllPlaceCandidates(false);
     setPlaceSearchState({ status: "idle", message: "" });
     setDestinations((current) =>
       sortDestinations(
@@ -715,13 +943,16 @@ export default function Home() {
 
   function deleteDestination(destinationId: string) {
     const destination = destinations.find((item) => item.id === destinationId);
+    if (!destination || !window.confirm("確定刪除這筆歷史紀錄嗎？")) {
+      return;
+    }
     setDestinations((current) => current.filter((item) => item.id !== destinationId));
     if (selectedDestinationId === destinationId) {
       setSelectedDestinationId("");
+      setDestinationForm(emptyDestinationForm);
+      setDestinationNotice(null);
     }
-    if (destination) {
-      appendEvent("刪除目的地", `${destination.name} 已從歷史目的地刪除`);
-    }
+    appendEvent("刪除目的地", `${destination.name} 已從歷史目的地刪除`);
   }
 
   async function startTrip() {
@@ -778,6 +1009,30 @@ export default function Home() {
     setRadiusNotice(
       safeValue === value ? "" : `已抵達判斷距離不可大於快到提醒距離，已調整為 ${formatDistance(safeValue)}。`
     );
+  }
+
+  function chooseTripDuration(value: number) {
+    setTripDurationMinutes(value);
+    setCustomTripDurationInput("");
+  }
+
+  function applyCustomTripDuration() {
+    const parsed = Number(customTripDurationInput.trim());
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 10 || parsed > 720) {
+      setRadiusNotice("行程有效時間請輸入 10 到 720 分鐘之間的整數。");
+      return;
+    }
+    setTripDurationMinutes(parsed);
+    setRadiusNotice("");
+  }
+
+  function toggleTripRecipient(code: string, checked: boolean) {
+    setSelectedTripRecipients((current) => {
+      if (checked) {
+        return Array.from(new Set([...current, code]));
+      }
+      return current.filter((item) => item !== code);
+    });
   }
 
   function resetPreflightChecks() {
@@ -893,11 +1148,12 @@ export default function Home() {
     milestoneRef.current = new Set();
     eventGateRef.current = new Set();
     tripStartedRef.current = false;
+    autoCloudShareStartedRef.current = false;
     setOwnerTripMuted(false);
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
     appendEvent(
       "正式開始旅程",
-      `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}`
+      `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
     );
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
@@ -907,7 +1163,7 @@ export default function Home() {
           setStrongAlert(null);
           appendEvent(
             "開始行程",
-            `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}`
+            `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
           );
         }
         handlePositionUpdate(position, preflightDestination, preflightRadiusMeters, preflightArrivalRadiusMeters);
@@ -1019,12 +1275,13 @@ export default function Home() {
     setPreflightOpen(false);
     setPreflightDestination(null);
     tripStartedRef.current = false;
+    autoCloudShareStartedRef.current = false;
     setCloudShare((current) =>
       current.status === "active" ? { ...current, status: "idle", message: "共享行程已停止" } : current
     );
   }
 
-  async function enableCloudSharing() {
+  async function enableCloudSharing(forceEndExisting = false) {
     if (!activeTrip || !user) {
       return;
     }
@@ -1037,10 +1294,13 @@ export default function Home() {
     }
 
     setCloudShare({ status: "creating", message: "正在建立分享連結..." });
+    setExistingCloudTrip(null);
 
     const shareCode = createShareCode();
     const shareUrl = `${window.location.origin}/share/${shareCode}`;
     const approximate = activeTrip.lastPosition ? getApproximateLocation(activeTrip.lastPosition.lat, activeTrip.lastPosition.lng) : null;
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + tripDurationMinutes * 60_000).toISOString();
 
     try {
       await supabase.from("users").upsert(
@@ -1050,6 +1310,36 @@ export default function Home() {
         },
         { ignoreDuplicates: true, onConflict: "user_code" }
       );
+
+      const nowIso = new Date().toISOString();
+      const { data: existingTrip } = await supabase
+        .from("trips")
+        .select("*")
+        .eq("owner_code", user.code)
+        .is("ended_at", null)
+        .or(`expires_at.is.null,expires_at.gt.${nowIso}`)
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingTrip && !forceEndExisting) {
+        setExistingCloudTrip(existingTrip as FamilyTripRow);
+        setCloudShare({
+          status: "error",
+          message: "你目前已有一趟進行中的行程。"
+        });
+        return;
+      }
+
+      if (existingTrip && forceEndExisting) {
+        await supabase
+          .from("trips")
+          .update({
+            status: "ended",
+            ended_at: new Date().toISOString()
+          })
+          .eq("id", (existingTrip as { id: string }).id);
+      }
 
       const { data, error } = await supabase
         .from("trips")
@@ -1068,7 +1358,9 @@ export default function Home() {
           current_lng: activeTrip.lastPosition?.lng ?? null,
           approximate_lat: approximate?.lat ?? null,
           approximate_lng: approximate?.lng ?? null,
-          last_location_at: activeTrip.lastPosition?.updatedAt ?? null
+          last_location_at: activeTrip.lastPosition?.updatedAt ?? null,
+          duration_minutes: tripDurationMinutes,
+          expires_at: expiresAt
         })
         .select("id, share_code")
         .single();
@@ -1077,12 +1369,27 @@ export default function Home() {
         throw error ?? new Error("Missing trip row");
       }
 
+      const recipientCodes = selectedTripRecipients.filter((code) => code !== user.code);
+      if (recipientCodes.length > 0) {
+        const recipientRows = recipientCodes.map((code) => ({
+          trip_id: data.id,
+          share_code: data.share_code,
+          owner_code: user.code,
+          recipient_code: code,
+          source: "manual_start_selection",
+          can_view: true,
+          can_receive_notifications: true
+        }));
+        await supabase.from("trip_recipients").insert(recipientRows);
+      }
+
       setCloudShare({
         status: "active",
-        message: "家人共享已開啟",
+        message: `家人共享已開啟，有效時間 ${formatTripDuration(tripDurationMinutes)}`,
         tripId: data.id,
         shareCode: data.share_code,
-        shareUrl
+        shareUrl,
+        expiresAt
       });
       appendEvent("開啟家人共享", `分享連結已建立：${shareUrl}`);
       void notifyFamilyTripEvent(data.share_code, "trip_started");
@@ -1121,19 +1428,50 @@ export default function Home() {
     }
   }
 
-  function openViewerTrip(event: FormEvent<HTMLFormElement>) {
+  async function openViewerTrip(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const shareCode = viewerShareCode.trim();
-    const viewerCode = viewerCodeInput.trim().toUpperCase();
-    if (!shareCode) {
-      setViewerEntryMessage("請輸入行程代碼。");
+    if (!user) {
       return;
     }
-    if (viewerCode) {
-      window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, viewerCode);
+    const ownerCode = viewerCodeInput.trim().toUpperCase();
+    const shareCode = viewerShareCode.trim();
+    if (!ownerCode) {
+      setViewerEntryMessage("請先輸入家人代號。");
+      return;
     }
-    const query = viewerCode ? `?viewer=${encodeURIComponent(viewerCode)}` : "";
-    window.location.href = `/share/${encodeURIComponent(shareCode)}${query}`;
+    await openFamilyTripByOwner(ownerCode, shareCode || undefined);
+  }
+
+  async function openFamilyTripByOwner(ownerCode: string, shareCode?: string) {
+    if (!user) {
+      return;
+    }
+
+    setViewerEntryMessage("正在查詢家人目前行程...");
+    const query = new URLSearchParams({
+      viewer_code: user.code,
+      owner_code: ownerCode
+    });
+    if (shareCode) {
+      query.set("share_code", shareCode);
+    }
+
+    try {
+      const response = await fetch(`/api/family/trips?${query.toString()}`);
+      const payload = (await response.json()) as { ok?: boolean; error?: string; message?: string; trip?: FamilyTripRow; trips?: FamilyTripRow[] };
+      if (!response.ok || payload.ok === false) {
+        setViewerEntryMessage(payload.error ?? "查詢失敗，請稍後再試。");
+        return;
+      }
+      const trip = payload.trip ?? payload.trips?.[0];
+      if (!trip?.share_code) {
+        setViewerEntryMessage(payload.message ?? "這位家人目前沒有進行中的行程。");
+        return;
+      }
+      window.location.href = `/share/${encodeURIComponent(trip.share_code)}?viewer=${encodeURIComponent(user.code)}`;
+    } catch (error) {
+      setViewerEntryMessage(`查詢失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
+    }
   }
 
   async function ensureCloudUser(profile: UserProfile) {
@@ -1164,7 +1502,7 @@ export default function Home() {
 
   async function loadFamilyTrips(code: string) {
     try {
-      const response = await fetch(`/api/family/trips?code=${encodeURIComponent(code)}`);
+      const response = await fetch(`/api/family/trips?viewer_code=${encodeURIComponent(code)}`);
       const payload = (await response.json()) as { trips?: FamilyTripRow[] };
       setFamilyTrips(payload.trips ?? []);
     } catch {
@@ -1206,6 +1544,9 @@ export default function Home() {
     if (!user) {
       return;
     }
+    if (!window.confirm("確定刪除這位家人嗎？")) {
+      return;
+    }
     await fetch("/api/family/disconnect", {
       method: "POST",
       headers: {
@@ -1216,6 +1557,7 @@ export default function Home() {
         family_code: code
       })
     });
+    setSelectedTripRecipients((current) => current.filter((item) => item !== code));
     void loadFamilyConnections(user.code);
   }
 
@@ -1363,6 +1705,139 @@ export default function Home() {
     } catch (error) {
       setAudioStatus(`本趟通知停止失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
     }
+  }
+
+  function updateTestTripState({
+    distanceMeters,
+    status,
+    updatedAt
+  }: {
+    distanceMeters?: number;
+    status?: TripStatus;
+    updatedAt?: string;
+  }) {
+    if (!activeTrip) {
+      setTestModeMessage("請先開始一趟測試行程。");
+      return;
+    }
+
+    const nextUpdatedAt = updatedAt ?? activeTrip.lastPosition?.updatedAt ?? new Date().toISOString();
+    const nextPosition = activeTrip.lastPosition
+      ? { ...activeTrip.lastPosition, updatedAt: nextUpdatedAt }
+      : undefined;
+    const nextStatus = status ?? activeTrip.status;
+    setActiveTrip((trip) =>
+      trip
+        ? {
+            ...trip,
+            distanceMeters: distanceMeters ?? trip.distanceMeters,
+            lastPosition: nextPosition,
+            status: nextStatus,
+            health: getLocationHealth(nextUpdatedAt)
+          }
+        : trip
+    );
+
+    const share = cloudShareRef.current;
+    if (supabase && share.status === "active" && share.tripId) {
+      void supabase
+        .from("trips")
+        .update({
+          distance_m: distanceMeters ?? activeTrip.distanceMeters ?? null,
+          status: nextStatus,
+          last_location_at: nextUpdatedAt
+        })
+        .eq("id", share.tripId);
+    }
+    setTestModeMessage("測試狀態已套用。");
+  }
+
+  function simulateTestDistance(distanceMeters: number) {
+    updateTestTripState({
+      distanceMeters,
+      status: distanceMeters <= arrivalRadiusMeters ? "已抵達" : distanceMeters <= radiusMeters ? "快到目的地" : "行程中",
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  function simulateTestStale(minutes: number) {
+    updateTestTripState({
+      updatedAt: new Date(Date.now() - minutes * 60_000).toISOString(),
+      status: minutes >= 5 ? "定位中斷" : "定位延遲"
+    });
+  }
+
+  function simulateTestExpired() {
+    const share = cloudShareRef.current;
+    if (!activeTrip) {
+      setTestModeMessage("請先開始一趟測試行程。");
+      return;
+    }
+    const expiredAt = new Date(Date.now() - 60_000).toISOString();
+    setCloudShare((current) => (current.status === "active" ? { ...current, expiresAt: expiredAt, message: "測試模式：行程已逾時" } : current));
+    if (supabase && share.status === "active" && share.tripId) {
+      void supabase.from("trips").update({ expires_at: expiredAt, status: "expired" }).eq("id", share.tripId);
+    }
+    setTestModeMessage("已模擬行程逾時。");
+  }
+
+  function simulateTestArrived() {
+    simulateTestDistance(Math.min(arrivalRadiusMeters, 90));
+    setStrongAlert("測試模式：已抵達目的地附近。");
+  }
+
+  async function testOwnerNotification() {
+    showLocalTestNotification();
+    appendNotificationCenterItem({
+      type: "測試本人通知",
+      success: true,
+      shareCode: cloudShareRef.current.shareCode ?? null,
+      recipientCode: user?.code ?? null
+    });
+    setTestModeMessage("已送出本機測試通知。");
+  }
+
+  async function testFamilyNotification() {
+    const share = cloudShareRef.current;
+    if (share.status !== "active" || !share.shareCode) {
+      setTestModeMessage("請先開始一趟測試行程並開啟家人共享。");
+      return;
+    }
+    try {
+      await notifyFamilyTripEvent(share.shareCode, "trip_started");
+      appendNotificationCenterItem({
+        type: "測試家人通知",
+        success: true,
+        shareCode: share.shareCode,
+        recipientCode: selectedTripRecipients.join(",")
+      });
+      setTestModeMessage("已呼叫家人通知測試。");
+    } catch (error) {
+      setTestModeMessage(`家人通知測試失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
+    }
+  }
+
+  function testFamilyWake() {
+    simulateWake();
+    setTestModeMessage("已觸發本機家人呼叫測試。");
+  }
+
+  async function clearTripMuteForTest() {
+    const share = cloudShareRef.current;
+    if (!supabase || share.status !== "active" || !share.shareCode || !user) {
+      setOwnerTripMuted(false);
+      setTripAlertSoundStatus("已解鎖");
+      setTestModeMessage("已清除本機停止狀態。");
+      return;
+    }
+    const { error } = await supabase
+      .from("trip_notification_mutes")
+      .update({ muted: false })
+      .eq("share_code", share.shareCode)
+      .eq("user_code", user.code);
+    setOwnerTripMuted(false);
+    setTripAlertSoundStatus("已解鎖");
+    setTestModeMessage(error ? `清除停止狀態失敗：${error.message}` : "已清除本趟通知停止狀態。");
   }
 
   async function endCloudTrip(status: string) {
@@ -1620,7 +2095,11 @@ export default function Home() {
   }
 
   async function deleteFamilyMember(member: FamilyMember) {
+    if (!window.confirm("確定刪除這位家人嗎？")) {
+      return;
+    }
     setFamily((current) => current.filter((item) => item.id !== member.id));
+    setSelectedTripRecipients((current) => current.filter((item) => item !== member.code));
     appendEvent("刪除家人權限", `${member.code} 的權限已刪除`);
     if (supabase && user) {
       try {
@@ -1648,11 +2127,16 @@ export default function Home() {
     setDestinationNotice(null);
     setAdvancedDestinationOpen(false);
     setPlaceCandidates([]);
+    setShowAllPlaceCandidates(false);
     setPlaceSearchState({ status: "idle", message: "" });
     setRadiusMeters(DEFAULT_TRIP_SETTINGS.alertRadiusMeters);
     setCustomRadiusInput("");
     setRadiusNotice("");
     setArrivalRadiusMeters(DEFAULT_TRIP_SETTINGS.arrivalRadiusMeters);
+    setTripDurationMinutes(DEFAULT_TRIP_DURATION_MINUTES);
+    setCustomTripDurationInput("");
+    setSelectedTripRecipients([]);
+    setExistingCloudTrip(null);
     setPrivacySettings(DEFAULT_PRIVACY_SETTINGS);
     setFamily([]);
     setEvents([]);
@@ -1673,9 +2157,9 @@ export default function Home() {
           <h1>到站提醒與家人協助叫醒</h1>
           <div className="entry-tabs">
             <span>我要開始行程</span>
-            <span>我是家人，輸入行程代碼查看</span>
+            <span>我是家人，用代號查看</span>
           </div>
-          <p className="muted">本人請先建立本機暱稱；家人也可以直接用行程代碼查看共享行程。</p>
+          <p className="muted">本人請先建立本機暱稱；家人完成連線後可用家人代號查看目前行程，分享連結作為備用。</p>
           <form className="stack" onSubmit={handleCreateUser}>
             <label>
               暱稱
@@ -1712,16 +2196,398 @@ export default function Home() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
+      <header className="topbar app-topbar">
         <div>
-          <p className="eyebrow">GeoClock Web</p>
-          <h1>旅程提醒</h1>
+          <p className="eyebrow">GeoClock</p>
+          <h1>到站提醒</h1>
+          <p className="mobile-subtitle">家人協助通知</p>
+          <p className="muted">我的代號：<button className="inline-code-button" onClick={() => navigator.clipboard.writeText(user.code)} type="button">{user.code}</button></p>
         </div>
-        <button className="ghost-button small-button" onClick={resetLocalData}>
-          重設資料
+        <button className="secondary-button small-button settings-button" onClick={() => setSidebarOpen(true)} type="button">
+          設定
+          {diagnosticsWarningCount > 0 || notificationState.status !== "已啟用" ? <span className="status-dot" aria-hidden="true" /> : null}
         </button>
       </header>
 
+      <section className="status-strip" aria-label="狀態摘要">
+        <button className={notificationState.status === "已啟用" ? "status-badge good-badge" : "status-badge warning-badge"} onClick={() => { setSidebarSection("notifications"); setSidebarOpen(true); }} type="button">
+          {notificationBadge}
+        </button>
+        <button className={soundBadge.includes("已解鎖") ? "status-badge good-badge" : "status-badge"} onClick={() => { setSidebarSection("notifications"); setSidebarOpen(true); }} type="button">
+          {soundBadge}
+        </button>
+        <button className="status-badge" onClick={() => { setSidebarSection("family"); setSidebarOpen(true); }} type="button">
+          家人：{activeFamilyConnectionsCount} 人
+        </button>
+        <button className={locationBadge.includes("暫停") || locationBadge.includes("中斷") || locationBadge.includes("失效") ? "status-badge warning-badge" : "status-badge"} onClick={() => { setSidebarSection("diagnostics"); setSidebarOpen(true); }} type="button">
+          {locationBadge}
+        </button>
+        <button className={notificationUnreadCount > 0 ? "status-badge warning-badge" : "status-badge"} onClick={() => { setSidebarSection("notificationCenter"); setSidebarOpen(true); }} type="button">
+          通知中心：{notificationUnreadCount} 則
+        </button>
+      </section>
+
+      {strongAlert ? (
+        <section className="alert-panel" role="alert">
+          <p className="eyebrow">重要提醒</p>
+          <h2>{strongAlert}</h2>
+          {activeWakeRequest ? (
+            <button className="primary-button" onClick={acknowledgeWakeRequest}>
+              我醒了
+            </button>
+          ) : (
+            <button className="secondary-button" onClick={() => setStrongAlert(null)}>
+              知道了
+            </button>
+          )}
+        </section>
+      ) : null}
+
+      <section className="v6-main-grid">
+        <article className="card v6-action-card">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">開始行程</p>
+              <h2>我要開始行程</h2>
+            </div>
+            <button className="ghost-button small-button" onClick={() => { setSidebarSection("preflight"); setSidebarOpen(true); }} type="button">
+              行前測試
+            </button>
+          </div>
+
+          {!activeTrip ? (
+            <div className="stack">
+              <form className="compact-destination-form" onSubmit={handleDestinationSubmit}>
+                <label>
+                  目的地名稱
+                  <input
+                    value={destinationForm.name}
+                    onChange={(event) => setDestinationForm((form) => ({ ...form, name: event.target.value }))}
+                    placeholder="例如：台中車站"
+                  />
+                </label>
+                <label>
+                  地址或地點
+                  <input
+                    value={destinationForm.address}
+                    onChange={(event) => setDestinationForm((form) => ({ ...form, address: event.target.value }))}
+                    placeholder="輸入地點後可搜尋"
+                  />
+                </label>
+                <button className="secondary-button" disabled={placeSearchState.status === "loading"} onClick={searchPlaces} type="button">
+                  {placeSearchState.status === "loading" ? "搜尋中" : "搜尋地點"}
+                </button>
+                <button className="primary-button" type="submit">
+                  儲存目的地
+                </button>
+              </form>
+              {placeSearchState.message ? <p className={placeSearchState.status === "success" ? "inline-status good" : "inline-status warning"}>{placeSearchState.message}</p> : null}
+              {destinationNotice ? <p className="form-notice">{destinationNotice}</p> : null}
+              {placeCandidates.length > 0 ? (
+                <div className="candidate-list compact-list">
+                  {(showAllPlaceCandidates ? placeCandidates : placeCandidates.slice(0, 3)).map((candidate) => (
+                    <button className="candidate-button" key={candidate.id} onClick={() => selectPlaceCandidate(candidate)} type="button">
+                      <strong>{candidate.label}</strong>
+                      <span>{candidate.address}</span>
+                    </button>
+                  ))}
+                  {placeCandidates.length > 3 ? (
+                    <button className="secondary-button small-button" onClick={() => setShowAllPlaceCandidates((value) => !value)} type="button">
+                      {showAllPlaceCandidates ? "收合結果" : `顯示更多（${placeCandidates.length - 3}）`}
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="destination-list compact-list">
+                {destinations.length === 0 ? (
+                  <p className="muted">尚未建立目的地。</p>
+                ) : (
+                  destinations.slice(0, 4).map((destination) => (
+                    <div className={`destination-row ${selectedDestinationId === destination.id ? "selected" : ""}`} key={destination.id}>
+                      <button type="button" onClick={() => selectDestination(destination)}>
+                        <strong>{destination.name}</strong>
+                        <span>{destination.address}</span>
+                        <span className={hasCoordinates(destination) ? "good" : "warning"}>
+                          {hasCoordinates(destination) ? "已取得目的地定位" : "定位資料尚未取得"}
+                        </span>
+                      </button>
+                      <button
+                        aria-label={`刪除 ${destination.name}`}
+                        className="icon-danger-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          deleteDestination(destination.id);
+                        }}
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="radius-options">
+                {RADIUS_OPTIONS.map((option) => (
+                  <button className={radiusMeters === option.value ? "selected" : ""} key={option.value} onClick={() => chooseAlertRadius(option.value)} type="button">
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <div className="status-grid">
+                <Metric label="快到提醒距離" value={formatDistance(radiusMeters)} />
+                <Metric label="已抵達判斷距離" value={formatDistance(arrivalRadiusMeters)} />
+              </div>
+              <details className="mobile-details">
+                <summary>進階距離設定</summary>
+                <div className="custom-radius-row">
+                  <label>
+                    自訂快到距離
+                    <input inputMode="numeric" value={customRadiusInput} onChange={(event) => setCustomRadiusInput(event.target.value)} placeholder="例如 750" />
+                  </label>
+                  <button className="secondary-button" onClick={applyCustomAlertRadius} type="button">
+                    套用
+                  </button>
+                </div>
+                <div className="radius-options">
+                  {ARRIVAL_RADIUS_OPTIONS.map((option) => (
+                    <button className={arrivalRadiusMeters === option ? "selected" : ""} key={option} onClick={() => chooseArrivalRadius(option)} type="button">
+                      {formatDistance(option)}
+                    </button>
+                  ))}
+                </div>
+                {radiusNotice ? <p className="field-hint">{radiusNotice}</p> : null}
+              </details>
+              <div className="stack">
+                <div className="section-heading">
+                  <div>
+                    <p className="eyebrow">行程有效時間</p>
+                    <p className="muted">GeoClock 會在這段時間內視為行程進行中。超過時間後，行程會顯示可能已失效，避免舊行程一直通知。</p>
+                  </div>
+                </div>
+                <div className="radius-options">
+                  {TRIP_DURATION_OPTIONS.map((option) => (
+                    <button className={tripDurationMinutes === option.value ? "selected" : ""} key={option.value} onClick={() => chooseTripDuration(option.value)} type="button">
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <details className="mobile-details">
+                  <summary>自訂有效時間</summary>
+                  <div className="custom-radius-row">
+                    <label>
+                      自訂分鐘
+                      <input inputMode="numeric" value={customTripDurationInput} onChange={(event) => setCustomTripDurationInput(event.target.value)} placeholder="例如 90" />
+                    </label>
+                    <button className="secondary-button" onClick={applyCustomTripDuration} type="button">
+                      套用
+                    </button>
+                  </div>
+                </details>
+              </div>
+              <div className="stack">
+                <p className="eyebrow">通知家人</p>
+                {confirmedFamilyOptions.length === 0 ? (
+                  <p className="muted">尚未連線家人。你仍可開始行程，之後用分享連結提供查看。</p>
+                ) : (
+                  <div className="permission-grid">
+                    {confirmedFamilyOptions.map((familyOption) => (
+                      <label className="toggle-row" key={familyOption.code}>
+                        <input
+                          checked={selectedTripRecipients.includes(familyOption.code)}
+                          onChange={(event) => toggleTripRecipient(familyOption.code, event.target.checked)}
+                          type="checkbox"
+                        />
+                        <span>
+                          {familyOption.code}
+                          {!familyPushEnabledCodes.has(familyOption.code) ? "（尚未啟用通知，但仍可在 GeoClock 內查看）" : ""}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="preflight-summary-row">
+                <span>行前檢查：{preflightBadge}</span>
+                <button className="secondary-button small-button" onClick={() => { setSidebarSection("preflight"); setSidebarOpen(true); }} type="button">
+                  查看詳情
+                </button>
+              </div>
+              {notificationState.status !== "已啟用" ? <p className="warning">尚未啟用背景通知，鎖屏後可能收不到提醒。仍可開始行程。</p> : null}
+              <p className="muted">背景通知會透過系統通知提醒。畫面開著時，可額外播放提示聲。</p>
+              <p className="muted">畫面開著時會持續更新位置；鎖屏或切到背景後，iPhone 可能暫停網頁定位。</p>
+              {existingCloudTrip ? (
+                <div className="inline-status warning">
+                  <strong>你目前已有一趟進行中的行程。</strong>
+                  <div className="trip-actions">
+                    <button className="secondary-button" onClick={() => (window.location.href = `/share/${existingCloudTrip.share_code}`)} type="button">
+                      回到目前行程
+                    </button>
+                    <button className="danger-button" onClick={() => void enableCloudSharing(true)} type="button">
+                      結束舊行程並開始新行程
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              <div className="trip-actions">
+                <button className="primary-button" disabled={!selectedDestination || Boolean(activeTrip)} onClick={startTrip} type="button">
+                  開始行程
+                </button>
+                <button className="secondary-button" onClick={() => { setSidebarSection("notifications"); setSidebarOpen(true); }} type="button">
+                  通知設定
+                </button>
+              </div>
+              {preflightOpen && preflightDestination ? (
+                <div className="inline-status">
+                  <strong>啟動前檢查：{preflightDestination.name}</strong>
+                  <p className="field-hint">定位測試成功後才能正式開始旅程。詳細測試在側欄。</p>
+                  <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={startOfficialTrip} type="button">
+                    正式開始旅程
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="stack">
+              <div className="status-grid">
+                <Metric label="目的地" value={activeTrip.destination.name} />
+                <Metric label="目前距離" value={formatDistance(activeTrip.distanceMeters)} />
+                <Metric label="狀態" value={activeTrip.status} />
+                <Metric label="最後位置更新" value={formatTime(activeTrip.lastPosition?.updatedAt)} />
+                <Metric label="背景通知" value={notificationState.status} />
+                <Metric label="位置更新" value={getPublicLocationStatus(activeTrip.lastPosition?.updatedAt, false)} />
+              </div>
+              {foregroundLocationMessage ? <p className="form-notice">{foregroundLocationMessage}</p> : null}
+              {cloudShare.expiresAt && Date.now() >= new Date(cloudShare.expiresAt).getTime() ? (
+                <p className="warning">行程已超過有效時間，是否結束？</p>
+              ) : null}
+              <p className="notice">若一段時間沒有更新，家人會看到位置更新暫停。若需要穩定背景定位，之後需做原生 App。</p>
+              <div className="trip-actions">
+                <button className="secondary-button" disabled={ownerTripMuted} onClick={stopOwnerTripNotifications} type="button">
+                  停止本趟通知
+                </button>
+                <button className="danger-button" onClick={stopTrip} type="button">
+                  結束行程
+                </button>
+              </div>
+              {mapDestination && hasCoordinates(mapDestination) ? (
+                <div className="map-block compact-map">
+                  <TripMap currentPosition={mapPosition} destination={mapDestination} radiusMeters={mapRadiusMeters} />
+                </div>
+              ) : null}
+            </div>
+          )}
+        </article>
+
+        <article className="card v6-action-card">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">查看家人</p>
+              <h2>我要查看家人</h2>
+            </div>
+            <button className="ghost-button small-button" onClick={() => { setSidebarSection("family"); setSidebarOpen(true); }} type="button">
+              家人設定
+            </button>
+          </div>
+          <FamilyTripsPanel
+            connections={familyConnections}
+            currentUserCode={user.code}
+            onOpenFamilySettings={() => { setSidebarSection("family"); setSidebarOpen(true); }}
+            onRefresh={() => user && void loadFamilyTrips(user.code)}
+            onViewOwner={(ownerCode) => void openFamilyTripByOwner(ownerCode)}
+            trips={familyTrips}
+          />
+          <div className="manual-viewer-panel">
+            <button className="advanced-toggle" onClick={() => setManualViewerOpen((value) => !value)} type="button">
+              <span>用代號手動查看</span>
+              <span>{manualViewerOpen ? "收合" : "展開"}</span>
+            </button>
+            {manualViewerOpen ? (
+              <form className="viewer-entry compact-viewer-entry" onSubmit={openViewerTrip}>
+                <label>
+                  家人代號
+                  <input value={viewerCodeInput} onChange={(event) => setViewerCodeInput(event.target.value.toUpperCase())} placeholder="例如 FAMILY-1234" required />
+                </label>
+                <label>
+                  行程代碼，選填
+                  <input value={viewerShareCode} onChange={(event) => setViewerShareCode(event.target.value)} placeholder="選填；只有對方給你特定行程代碼時才需要" />
+                </label>
+                <button className="primary-button" type="submit">
+                  查看家人目前行程
+                </button>
+                {viewerEntryMessage ? <p className="warning">{viewerEntryMessage}</p> : null}
+              </form>
+            ) : null}
+          </div>
+        </article>
+      </section>
+
+      <SettingsSidebar
+        activeSection={sidebarSection}
+        activeTrip={activeTrip}
+        audioCheck={audioCheck}
+        cloudShare={cloudShare}
+        connectionCode={connectionCode}
+        connectionPermissions={connectionPermissions}
+        diagnosticsWarningCount={diagnosticsWarningCount}
+        events={events}
+        familyConnectionMessage={familyConnectionMessage}
+        familyConnections={familyConnections}
+        isOpen={sidebarOpen}
+        locationCheck={locationCheck}
+        notificationDiagnostics={notificationDiagnostics}
+        notificationCenterItems={notificationCenterItems}
+        notificationCenterMessage={notificationCenterMessage}
+        notificationState={notificationState}
+        onClearLocalNotificationCenter={clearLocalNotificationCenter}
+        onClearTripMuteForTest={clearTripMuteForTest}
+        onClose={() => setSidebarOpen(false)}
+        onConnectFamily={connectFamily}
+        onCopyShareCode={copyShareCode}
+        onCopyShareLink={copyShareLink}
+        onDeleteFamily={disconnectFamily}
+        onEnableCloudSharing={enableCloudSharing}
+        onEnableNotifications={enableNotifications}
+        onResetLocalData={resetLocalData}
+        onRunPreflightAll={runPreflightAll}
+        onSectionChange={setSidebarSection}
+        onLoadNotificationCenter={loadNotificationCenter}
+        onMarkNotificationCenterRead={markNotificationCenterRead}
+        onSimulateArrived={simulateTestArrived}
+        onSimulateDistance={simulateTestDistance}
+        onSimulateEndTrip={stopTrip}
+        onSimulateExpired={simulateTestExpired}
+        onSimulateStale={simulateTestStale}
+        onStartOfficialTrip={startOfficialTrip}
+        onStopOwnerTripNotifications={stopOwnerTripNotifications}
+        onTestFamilyNotification={testFamilyNotification}
+        onTestFamilyWake={testFamilyWake}
+        onTestOwnerNotification={testOwnerNotification}
+        onTestAlertAudio={testAlertAudio}
+        onTestLocation={testLocation}
+        onTestVibration={testVibration}
+        onTestWakeLock={testWakeLock}
+        ownerTripMuted={ownerTripMuted}
+        preflightArrivalRadiusMeters={preflightArrivalRadiusMeters}
+        preflightCanStart={preflightCanStart}
+        preflightChecksAttempted={preflightChecksAttempted}
+        preflightDestination={preflightDestination}
+        preflightOpen={preflightOpen}
+        preflightRadiusMeters={preflightRadiusMeters}
+        preflightResults={preflightResults}
+        preflightSummary={preflightSummary}
+        setConnectionCode={setConnectionCode}
+        setConnectionPermissions={setConnectionPermissions}
+        tripAlertSoundStatus={tripAlertSoundStatus}
+        testModeMessage={testModeMessage}
+        user={user}
+        vibrationCheck={vibrationCheck}
+        wakeLockCheck={wakeLockCheck}
+        wakeLockStatus={wakeLockStatus}
+      />
+
+      <div className="legacy-v05-panels" aria-hidden="true">
       <section className="card">
         <p className="eyebrow">首頁模式</p>
         <div className="mode-switch">
@@ -1941,7 +2807,15 @@ export default function Home() {
                     {hasCoordinates(destination) ? "已取得目的地定位" : "定位資料尚未取得"}
                   </span>
                 </button>
-                <button className="danger-button" type="button" onClick={() => deleteDestination(destination.id)}>
+                <button
+                  className="icon-danger-button"
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    deleteDestination(destination.id);
+                  }}
+                  aria-label={`刪除 ${destination.name}`}
+                >
                   刪除
                 </button>
               </div>
@@ -2147,7 +3021,7 @@ export default function Home() {
               </div>
             </div>
           ) : (
-            <button className="primary-button" disabled={cloudShare.status === "creating"} onClick={enableCloudSharing} type="button">
+            <button className="primary-button" disabled={cloudShare.status === "creating"} onClick={() => void enableCloudSharing()} type="button">
               {cloudShare.status === "creating" ? "建立中" : "開啟家人共享"}
             </button>
           )}
@@ -2212,7 +3086,15 @@ export default function Home() {
                       <span>{getConnectionStatusLabel(connection)}</span>
                       <p className="field-hint">{formatPermissionSummary(myPermissions)}</p>
                     </div>
-                    <button className="danger-button" onClick={() => disconnectFamily(otherCode)} type="button">
+                    <button
+                      className="icon-danger-button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        disconnectFamily(otherCode);
+                      }}
+                      type="button"
+                      aria-label={`刪除 ${otherCode}`}
+                    >
                       解除
                     </button>
                   </div>
@@ -2279,7 +3161,15 @@ export default function Home() {
                     <strong>{member.code}</strong>
                     <span>{getFamilyPermissionLabel(member.permission)}</span>
                   </div>
-                  <button className="danger-button" onClick={() => deleteFamilyMember(member)}>
+                  <button
+                    className="icon-danger-button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      deleteFamilyMember(member);
+                    }}
+                    type="button"
+                    aria-label={`刪除 ${member.code}`}
+                  >
                     刪除
                   </button>
                 </div>
@@ -2319,7 +3209,438 @@ export default function Home() {
           </ol>
         ) : null}
       </section>
+      </div>
     </main>
+  );
+}
+
+function SettingsSidebar({
+  activeSection,
+  activeTrip,
+  audioCheck,
+  cloudShare,
+  connectionCode,
+  connectionPermissions,
+  diagnosticsWarningCount,
+  events,
+  familyConnectionMessage,
+  familyConnections,
+  isOpen,
+  locationCheck,
+  notificationDiagnostics,
+  notificationCenterItems,
+  notificationCenterMessage,
+  notificationState,
+  onClearLocalNotificationCenter,
+  onClearTripMuteForTest,
+  onClose,
+  onConnectFamily,
+  onCopyShareCode,
+  onCopyShareLink,
+  onDeleteFamily,
+  onEnableCloudSharing,
+  onEnableNotifications,
+  onResetLocalData,
+  onRunPreflightAll,
+  onLoadNotificationCenter,
+  onMarkNotificationCenterRead,
+  onSectionChange,
+  onSimulateArrived,
+  onSimulateDistance,
+  onSimulateEndTrip,
+  onSimulateExpired,
+  onSimulateStale,
+  onStartOfficialTrip,
+  onStopOwnerTripNotifications,
+  onTestFamilyNotification,
+  onTestFamilyWake,
+  onTestOwnerNotification,
+  onTestAlertAudio,
+  onTestLocation,
+  onTestVibration,
+  onTestWakeLock,
+  ownerTripMuted,
+  preflightCanStart,
+  preflightChecksAttempted,
+  preflightDestination,
+  preflightOpen,
+  preflightResults,
+  preflightSummary,
+  setConnectionCode,
+  setConnectionPermissions,
+  tripAlertSoundStatus,
+  testModeMessage,
+  user,
+  vibrationCheck,
+  wakeLockCheck,
+  wakeLockStatus
+}: {
+  activeSection: SidebarSection;
+  activeTrip: ActiveTrip | null;
+  audioCheck: PreflightCheckState;
+  cloudShare: CloudShareState;
+  connectionCode: string;
+  connectionPermissions: FamilyPermissions;
+  diagnosticsWarningCount: number;
+  events: EventRecord[];
+  familyConnectionMessage: string;
+  familyConnections: FamilyConnectionRow[];
+  isOpen: boolean;
+  locationCheck: LocationCheckState;
+  notificationDiagnostics: NotificationDiagnostic[];
+  notificationCenterItems: NotificationCenterItem[];
+  notificationCenterMessage: string;
+  notificationState: NotificationState;
+  onClearLocalNotificationCenter: () => void;
+  onClearTripMuteForTest: () => void;
+  onClose: () => void;
+  onConnectFamily: (event: FormEvent<HTMLFormElement>) => void;
+  onCopyShareCode: () => void;
+  onCopyShareLink: () => void;
+  onDeleteFamily: (code: string) => void;
+  onEnableCloudSharing: () => void;
+  onEnableNotifications: () => void;
+  onResetLocalData: () => void;
+  onRunPreflightAll: () => void;
+  onLoadNotificationCenter: () => void;
+  onMarkNotificationCenterRead: () => void;
+  onSectionChange: (section: SidebarSection) => void;
+  onSimulateArrived: () => void;
+  onSimulateDistance: (distanceMeters: number) => void;
+  onSimulateEndTrip: () => void;
+  onSimulateExpired: () => void;
+  onSimulateStale: (minutes: number) => void;
+  onStartOfficialTrip: () => void;
+  onStopOwnerTripNotifications: () => void;
+  onTestFamilyNotification: () => void;
+  onTestFamilyWake: () => void;
+  onTestOwnerNotification: () => void;
+  onTestAlertAudio: () => void;
+  onTestLocation: () => void;
+  onTestVibration: () => void;
+  onTestWakeLock: () => void;
+  ownerTripMuted: boolean;
+  preflightArrivalRadiusMeters: number;
+  preflightCanStart: boolean;
+  preflightChecksAttempted: boolean;
+  preflightDestination: Destination | null;
+  preflightOpen: boolean;
+  preflightRadiusMeters: number;
+  preflightResults: PreflightCheckResult[];
+  preflightSummary: string;
+  setConnectionCode: (value: string) => void;
+  setConnectionPermissions: (updater: (current: FamilyPermissions) => FamilyPermissions) => void;
+  tripAlertSoundStatus: string;
+  testModeMessage: string;
+  user: UserProfile;
+  vibrationCheck: PreflightCheckState;
+  wakeLockCheck: PreflightCheckState;
+  wakeLockStatus: string;
+}) {
+  const toggleSection = (section: Exclude<SidebarSection, null>) => {
+    onSectionChange(activeSection === section ? null : section);
+  };
+
+  return (
+    <>
+      {isOpen ? <button className="sidebar-backdrop" aria-label="關閉設定" onClick={onClose} type="button" /> : null}
+      <aside className={`settings-sidebar ${isOpen ? "open" : ""}`} aria-hidden={!isOpen}>
+        <div className="sidebar-header">
+          <div>
+            <p className="eyebrow">設定</p>
+            <h2>GeoClock</h2>
+            <p className="field-hint">測試、通知、家人連線與診斷都放在這裡。</p>
+          </div>
+          <button className="secondary-button small-button" onClick={onClose} type="button">
+            關閉
+          </button>
+        </div>
+
+        <SidebarPanel
+          isOpen={activeSection === "preflight"}
+          onToggle={() => toggleSection("preflight")}
+          title="行前測試"
+          warning={preflightResults.some((item) => item.status === "failed")}
+        >
+          <p className="muted">主畫面只顯示摘要。定位、音效、震動與防鎖屏的細節在這裡測。</p>
+          <button className="primary-button" onClick={onRunPreflightAll} type="button">
+            一鍵測試所有
+          </button>
+          {preflightSummary ? <p className="form-notice">{preflightSummary}</p> : null}
+          {preflightResults.length > 0 ? <PreflightResultList items={preflightResults} /> : null}
+          {preflightOpen && preflightDestination ? (
+            <div className="preflight-list">
+              <p className="field-hint">準備前往 {preflightDestination.name}。定位測試成功後才能正式開始旅程。</p>
+              <PreflightRow actionLabel="測試定位" detail={locationCheck.position ? `${formatPosition(locationCheck.position)}，${formatTime(locationCheck.position.updatedAt)}` : undefined} label="定位" onAction={onTestLocation} state={locationCheck} />
+              <PreflightRow actionLabel="測試提示音" label="提示音" onAction={onTestAlertAudio} state={audioCheck} />
+              <PreflightRow actionLabel="測試震動" label="震動" onAction={onTestVibration} state={vibrationCheck} />
+              <PreflightRow actionLabel="嘗試防鎖屏" label="防鎖屏" onAction={onTestWakeLock} state={wakeLockCheck} />
+              {preflightChecksAttempted ? (
+                <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={onStartOfficialTrip} type="button">
+                  正式開始旅程
+                </button>
+              ) : (
+                <p className="muted">請先完成檢查。震動與防鎖屏若不支援，仍可開始旅程。</p>
+              )}
+            </div>
+          ) : null}
+        </SidebarPanel>
+
+        <SidebarPanel
+          isOpen={activeSection === "notifications"}
+          onToggle={() => toggleSection("notifications")}
+          title="通知設定"
+          warning={notificationState.status !== "已啟用"}
+        >
+          <div className="status-grid">
+            <Metric label="背景通知" value={notificationState.status} />
+            <Metric label="前景提示聲" value={tripAlertSoundStatus} />
+            <Metric label="本趟通知" value={ownerTripMuted ? "已停止" : "啟用中"} />
+            <Metric label="防鎖屏" value={wakeLockStatus} />
+          </div>
+          <p className="notice">背景通知會透過系統通知提醒。畫面開著時，可額外播放提示聲。</p>
+          <p className="muted">{getStandaloneHint()}</p>
+          <div className="trip-actions">
+            <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={onEnableNotifications} type="button">
+              啟用本人通知
+            </button>
+            <button className="secondary-button" onClick={() => showLocalTestNotification()} type="button">
+              測試通知
+            </button>
+            <button className="secondary-button" onClick={onTestAlertAudio} type="button">
+              測試提示音
+            </button>
+            <button className="secondary-button" disabled={!activeTrip || ownerTripMuted} onClick={onStopOwnerTripNotifications} type="button">
+              停止本趟通知
+            </button>
+          </div>
+          {activeTrip ? (
+            <div className="cloud-share-card card nested-card">
+              <p className="eyebrow">家人共享</p>
+              {cloudShare.status === "active" ? (
+                <div className="stack">
+                  <Metric label="行程代碼" value={cloudShare.shareCode ?? "尚未取得"} />
+                  <div className="trip-actions">
+                    <button className="secondary-button" onClick={onCopyShareCode} type="button">
+                      複製行程代碼
+                    </button>
+                    <button className="secondary-button" onClick={onCopyShareLink} type="button">
+                      複製分享連結
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button className="primary-button" disabled={cloudShare.status === "creating"} onClick={onEnableCloudSharing} type="button">
+                  {cloudShare.status === "creating" ? "建立中" : "開啟家人共享"}
+                </button>
+              )}
+              {cloudShare.message ? <p className={cloudShare.status === "error" ? "warning" : "muted"}>{cloudShare.message}</p> : null}
+            </div>
+          ) : null}
+        </SidebarPanel>
+
+        <SidebarPanel isOpen={activeSection === "family"} onToggle={() => toggleSection("family")} title="家人設定">
+          <p className="muted">我的代號</p>
+          <p className="big-code">{user.code}</p>
+          <button className="secondary-button" onClick={() => navigator.clipboard.writeText(user.code)} type="button">
+            複製代號
+          </button>
+          <form className="stack" onSubmit={onConnectFamily}>
+            <label>
+              輸入家人代號
+              <input value={connectionCode} onChange={(event) => setConnectionCode(event.target.value.toUpperCase())} placeholder="例如 MOM-2048" />
+            </label>
+            <div className="permission-grid">
+              {FAMILY_PERMISSION_OPTIONS.map((option) => (
+                <label className="toggle-row" key={option.key}>
+                  <input
+                    checked={connectionPermissions[option.key]}
+                    onChange={(event) =>
+                      setConnectionPermissions((current) => ({
+                        ...current,
+                        [option.key]: event.target.checked
+                      }))
+                    }
+                    type="checkbox"
+                  />
+                  <span>{option.label}</span>
+                </label>
+              ))}
+            </div>
+            <button className="primary-button" type="submit">
+              加入家人
+            </button>
+          </form>
+          {familyConnectionMessage ? <p className="form-notice">{familyConnectionMessage}</p> : null}
+          <div className="family-list">
+            {familyConnections.length === 0 ? (
+              <p className="muted">尚未連線家人。</p>
+            ) : (
+              familyConnections.map((connection) => {
+                const otherCode = connection.user_a_code === user.code ? connection.user_b_code : connection.user_a_code;
+                const myPermissions = connection.user_a_code === user.code ? connection.user_a_permissions : connection.user_b_permissions;
+                return (
+                  <div className="family-row" key={connection.id}>
+                    <div>
+                      <strong>{otherCode}</strong>
+                      <span>{getConnectionStatusLabel(connection)}</span>
+                      <p className="field-hint">{formatPermissionSummary(myPermissions)}</p>
+                    </div>
+                    <button
+                      className="icon-danger-button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onDeleteFamily(otherCode);
+                      }}
+                      type="button"
+                      aria-label={`刪除 ${otherCode}`}
+                    >
+                      移除
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </SidebarPanel>
+
+        <SidebarPanel isOpen={activeSection === "testMode"} onToggle={() => toggleSection("testMode")} title="測試模式">
+          <p className="warning">測試模式只用於開發驗證。</p>
+          {!activeTrip ? <p className="warning">請先開始一趟測試行程。</p> : null}
+          <div className="test-mode-group">
+            <p className="eyebrow">距離模擬</p>
+            <div className="test-button-grid">
+              <button className="secondary-button" disabled={!activeTrip} onClick={() => onSimulateDistance(2000)} type="button">2000m</button>
+              <button className="secondary-button" disabled={!activeTrip} onClick={() => onSimulateDistance(500)} type="button">500m</button>
+              <button className="secondary-button" disabled={!activeTrip} onClick={() => onSimulateDistance(90)} type="button">90m</button>
+            </div>
+          </div>
+          <div className="test-mode-group">
+            <p className="eyebrow">狀態模擬</p>
+            <div className="test-button-grid">
+              <button className="secondary-button" disabled={!activeTrip} onClick={() => onSimulateStale(2)} type="button">位置更新暫停</button>
+              <button className="secondary-button" disabled={!activeTrip} onClick={() => onSimulateStale(6)} type="button">定位可能中斷</button>
+              <button className="secondary-button" disabled={!activeTrip} onClick={onSimulateExpired} type="button">行程逾時</button>
+              <button className="secondary-button" disabled={!activeTrip} onClick={onSimulateArrived} type="button">已抵達</button>
+            </div>
+          </div>
+          <div className="test-mode-group">
+            <p className="eyebrow">通知測試</p>
+            <div className="test-button-grid">
+              <button className="secondary-button" onClick={onTestOwnerNotification} type="button">本人通知</button>
+              <button className="secondary-button" onClick={onTestFamilyNotification} type="button">家人通知</button>
+              <button className="secondary-button" onClick={onTestFamilyWake} type="button">家人呼叫</button>
+            </div>
+          </div>
+          <div className="test-mode-group">
+            <p className="eyebrow">清理</p>
+            <div className="test-button-grid">
+              <button className="danger-button" disabled={!activeTrip} onClick={onSimulateEndTrip} type="button">模擬結束行程</button>
+              <button className="secondary-button" onClick={onClearTripMuteForTest} type="button">清除本趟通知停止狀態</button>
+            </div>
+          </div>
+          {testModeMessage ? <p className="form-notice">{testModeMessage}</p> : null}
+        </SidebarPanel>
+
+        <SidebarPanel
+          isOpen={activeSection === "notificationCenter"}
+          onToggle={() => toggleSection("notificationCenter")}
+          title={`通知中心：${notificationCenterItems.filter((item) => !item.read).length} 則`}
+          warning={notificationCenterItems.some((item) => !item.success)}
+        >
+          <div className="trip-actions">
+            <button className="secondary-button" onClick={onLoadNotificationCenter} type="button">
+              重新載入
+            </button>
+            <button className="secondary-button" onClick={onMarkNotificationCenterRead} type="button">
+              全部標記已讀
+            </button>
+            <button className="danger-button" onClick={onClearLocalNotificationCenter} type="button">
+              清除本機紀錄
+            </button>
+          </div>
+          {notificationCenterMessage ? <p className="field-hint">{notificationCenterMessage}</p> : null}
+          <div className="notification-center-list">
+            {notificationCenterItems.length === 0 ? (
+              <p className="muted">尚無通知紀錄。</p>
+            ) : (
+              notificationCenterItems.map((item) => (
+                <div className={`notification-center-item ${item.read ? "" : "unread"}`} key={item.id}>
+                  <div>
+                    <strong>{item.type}</strong>
+                    <span>{formatTime(item.time)}</span>
+                  </div>
+                  <p className={item.success ? "good" : "warning"}>{item.success ? "成功" : "失敗"}</p>
+                  {item.error ? (
+                    <details className="notification-detail">
+                      <summary>查看失敗原因</summary>
+                      <p className="field-hint">{item.error}</p>
+                    </details>
+                  ) : null}
+                  <p className="field-hint">
+                    {item.shareCode ? `share_code：${item.shareCode}` : null}
+                    {item.shareCode && item.recipientCode ? " / " : null}
+                    {item.recipientCode ? `recipient：${item.recipientCode}` : null}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+        </SidebarPanel>
+
+        <SidebarPanel
+          isOpen={activeSection === "diagnostics"}
+          onToggle={() => toggleSection("diagnostics")}
+          title="進階診斷"
+          warning={diagnosticsWarningCount > 0}
+        >
+          <DiagnosticList items={notificationDiagnostics} />
+          <div className="status-grid">
+            <Metric label="Wake Lock" value={wakeLockStatus} />
+            <Metric label="震動" value={vibrationCheck.status} />
+            <Metric label="定位測試" value={locationCheck.status} />
+            <Metric label="提示音" value={audioCheck.status} />
+          </div>
+          <p className="notice">畫面開著時會持續更新位置。鎖屏或切到背景後，iPhone 可能暫停網頁定位。</p>
+          <div className="event-list">
+            {events.slice(0, 5).map((event) => (
+              <div className="event-list-item" key={event.id}>
+                <span>{formatTime(event.createdAt)}</span>
+                <strong>{event.type}</strong>
+                <p>{event.message}</p>
+              </div>
+            ))}
+          </div>
+          <button className="danger-button" onClick={onResetLocalData} type="button">
+            重設本機資料
+          </button>
+        </SidebarPanel>
+      </aside>
+    </>
+  );
+}
+
+function SidebarPanel({
+  children,
+  isOpen,
+  onToggle,
+  title,
+  warning
+}: {
+  children: ReactNode;
+  isOpen: boolean;
+  onToggle: () => void;
+  title: string;
+  warning?: boolean;
+}) {
+  return (
+    <section className="sidebar-panel">
+      <button className="sidebar-panel-toggle" onClick={onToggle} type="button">
+        <span>{title}</span>
+        {warning ? <span className="status-dot" aria-hidden="true" /> : null}
+      </button>
+      {isOpen ? <div className="sidebar-panel-body">{children}</div> : null}
+    </section>
   );
 }
 
@@ -2366,34 +3687,85 @@ function PreflightResultList({ items }: { items: PreflightCheckResult[] }) {
   );
 }
 
-function FamilyTripsPanel({ onRefresh, trips }: { onRefresh: () => void; trips: FamilyTripRow[] }) {
+function FamilyTripsPanel({
+  connections = [],
+  currentUserCode,
+  onOpenFamilySettings,
+  onRefresh,
+  onViewOwner,
+  trips
+}: {
+  connections?: FamilyConnectionRow[];
+  currentUserCode?: string;
+  onOpenFamilySettings?: () => void;
+  onRefresh: () => void;
+  onViewOwner?: (ownerCode: string) => void;
+  trips: FamilyTripRow[];
+}) {
+  const connectedFamilies = currentUserCode
+    ? connections
+        .filter((connection) => connection.status === "confirmed")
+        .map((connection) => {
+          const ownerCode = connection.user_a_code === currentUserCode ? connection.user_b_code : connection.user_a_code;
+          return {
+            ownerCode,
+            connection,
+            trip: trips.find((trip) => trip.owner_code === ownerCode)
+          };
+        })
+    : [];
+
   return (
     <div className="stack">
       <div className="section-heading">
         <div>
-          <h2>進行中行程</h2>
-          <p className="muted">只列出已雙方確認、最近 24 小時內且尚未結束的家人行程。</p>
+          <h2>已連線家人</h2>
+          <p className="muted">選擇已連線家人即可查看目前行程；通常不需要行程代碼。</p>
         </div>
         <button className="secondary-button small-button" onClick={onRefresh} type="button">
           重新整理
         </button>
       </div>
-      {trips.length === 0 ? (
-        <p className="muted">目前沒有進行中的行程。</p>
+      {connectedFamilies.length === 0 && trips.length === 0 ? (
+        <div className="empty-state">
+          <strong>尚未連線家人</strong>
+          <p className="muted">到設定的家人設定輸入對方代號，雙方確認後即可查看目前行程。</p>
+          {onOpenFamilySettings ? (
+            <button className="secondary-button" onClick={onOpenFamilySettings} type="button">
+              前往家人設定
+            </button>
+          ) : null}
+        </div>
       ) : (
         <div className="family-list">
-          {trips.map((trip) => (
-            <div className="family-row" key={trip.id}>
-              <div>
-                <strong>{trip.owner_code}</strong>
-                <span>{trip.status}</span>
-                <p className="field-hint">最近更新：{formatTime(trip.last_location_at ?? undefined)}</p>
+          {(connectedFamilies.length > 0
+            ? connectedFamilies
+            : trips.map((trip) => ({ ownerCode: trip.owner_code, connection: null, trip }))
+          ).map((item) => {
+            const permissions = item.trip?.permissions;
+            const canWake = permissions?.can_wake_me !== false;
+            return (
+              <div className="family-row" key={item.ownerCode}>
+                <div>
+                  <strong>{item.ownerCode}</strong>
+                  <span>{item.connection ? getConnectionStatusLabel(item.connection) : "分享行程"}</span>
+                  <p className="field-hint">
+                    {item.trip ? `${getPublicLocationStatus(item.trip.last_location_at ?? undefined)}，最近更新：${formatTime(item.trip.last_location_at ?? undefined)}` : "這位家人目前沒有進行中的行程。"}
+                  </p>
+                </div>
+                <div className="family-row-actions">
+                  <button className="primary-button" onClick={() => (onViewOwner ? onViewOwner(item.ownerCode) : item.trip && (window.location.href = `/share/${item.trip.share_code}`))} type="button">
+                    查看目前行程
+                  </button>
+                  {canWake && item.trip ? (
+                    <button className="secondary-button" onClick={() => (window.location.href = `/share/${item.trip?.share_code}`)} type="button">
+                      呼叫
+                    </button>
+                  ) : null}
+                </div>
               </div>
-              <button className="primary-button" onClick={() => (window.location.href = `/share/${trip.share_code}`)} type="button">
-                查看 / 呼叫
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -2611,6 +3983,81 @@ function formatPermissionSummary(permissions: Partial<FamilyPermissions> | undef
   }
   const enabled = FAMILY_PERMISSION_OPTIONS.filter((option) => permissions[option.key]).map((option) => option.label);
   return enabled.length > 0 ? enabled.join("、") : "未授權功能";
+}
+
+function isNotificationCenterEvent(type: EventType) {
+  return [
+    "開始行程",
+    "快到目的地",
+    "已抵達",
+    "定位延遲",
+    "定位中斷",
+    "停止行程",
+    "模擬叫醒",
+    "通知訂閱成功",
+    "通知訂閱失敗",
+    "收到家人呼叫",
+    "已回應家人呼叫",
+    "雲端行程同步成功",
+    "雲端行程同步失敗"
+  ].includes(type);
+}
+
+function getPreflightSummaryLabel(items: PreflightCheckResult[]) {
+  if (items.length === 0) {
+    return "尚未測試";
+  }
+  const failed = items.filter((item) => item.status === "failed").length;
+  const warnings = items.filter((item) => item.status === "warning").length;
+  if (failed > 0) {
+    return `有 ${failed} 個失敗`;
+  }
+  if (warnings > 0) {
+    return `有 ${warnings} 個警告`;
+  }
+  return "通過";
+}
+
+function getPublicLocationStatus(updatedAt?: string, ended = false) {
+  if (ended) {
+    return "定位：行程已結束";
+  }
+  if (!updatedAt) {
+    return "定位：尚未取得";
+  }
+  const ageMs = Date.now() - new Date(updatedAt).getTime();
+  if (Number.isNaN(ageMs)) {
+    return "定位：尚未取得";
+  }
+  if (ageMs > 30 * 60 * 1000) {
+    return "位置更新：行程可能已失效";
+  }
+  if (ageMs > 5 * 60 * 1000) {
+    return "位置更新：定位可能中斷";
+  }
+  if (ageMs > 60 * 1000) {
+    return "位置更新：暫停";
+  }
+  return "定位：正常";
+}
+
+function showLocalTestNotification() {
+  if (!("Notification" in window)) {
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    return;
+  }
+  new Notification("GeoClock 測試通知", {
+    body: "背景通知測試。實際到站通知仍受 iPhone PWA 與系統設定限制。"
+  });
+}
+
+function formatTripDuration(minutes: number) {
+  if (minutes % 60 === 0) {
+    return `${minutes / 60} 小時`;
+  }
+  return `${minutes} 分鐘`;
 }
 
 function getSafeArrivalRadius(arrivalRadius: number, alertRadius: number) {

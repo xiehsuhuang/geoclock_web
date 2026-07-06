@@ -572,7 +572,8 @@ function SharedTripView({
           <Metric label="提醒聲" value={viewerAlertSoundStatus} />
           <Metric label="本趟通知" value={viewerTripMuted ? "已停止" : "啟用中"} />
         </div>
-        <p className="notice">通知功能需將網站加入 iPhone 主畫面後使用。Web Push 不是原生鬧鐘，不能保證無視靜音。</p>
+        <p className="notice">背景通知會透過系統通知提醒；畫面開著時，可額外播放提示聲。</p>
+        <p className="muted">通知功能需將網站加入 iPhone 主畫面後使用。Web Push 不是原生鬧鐘，不能保證無視靜音。</p>
         <p className="muted">{getStandaloneHint()}</p>
         <p className={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援" ? "warning" : "muted"}>
           {notificationState.message}
@@ -672,7 +673,9 @@ function normalizeTripRow(row: CloudTripRow, shareCode: string): CloudTripRow {
     approximate_lng: typeof row.approximate_lng === "number" ? row.approximate_lng : null,
     last_location_at: row.last_location_at ?? null,
     started_at: row.started_at ?? new Date().toISOString(),
-    ended_at: row.ended_at ?? null
+    ended_at: row.ended_at ?? null,
+    expires_at: row.expires_at ?? null,
+    duration_minutes: row.duration_minutes ?? null
   };
 }
 
@@ -688,6 +691,9 @@ function formatWakeDiagnostics(diagnostics: { ownerSubscriptions: number; pushSu
 function getSharedHealth(trip: CloudTripRow) {
   if (trip.ended_at || trip.status === "ended") {
     return "ended";
+  }
+  if (trip.expires_at && Date.now() >= new Date(trip.expires_at).getTime()) {
+    return "expired";
   }
   if (!trip.last_location_at) {
     return "unknown";

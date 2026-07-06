@@ -40,14 +40,14 @@ export async function POST(request: Request) {
 
   const { data: trip, error: tripError } = await supabase
     .from("trips")
-    .select("id, share_code, owner_code, ended_at, status")
+    .select("id, share_code, owner_code, ended_at, status, expires_at")
     .eq("share_code", shareCode)
     .maybeSingle();
   if (tripError || !trip) {
     return NextResponse.json({ ok: false, error: tripError?.message ?? "找不到行程。", sent: 0, failed: 0, skippedCooldown: 0 }, { status: 404 });
   }
 
-  const viewerCodes = await getNotificationViewerCodes(trip.owner_code);
+  const viewerCodes = await getNotificationViewerCodes(trip.owner_code, trip.share_code, type);
   if (viewerCodes.length === 0) {
     return NextResponse.json({ ok: true, sent: 0, failed: 0, skippedCooldown: 0 });
   }
@@ -68,8 +68,8 @@ export async function POST(request: Request) {
   let skippedCooldown = 0;
   const errors: string[] = [];
   const notificationPayload = JSON.stringify({
-    title: type === "trip_started" ? "GeoClock 行程已開始" : "GeoClock 行程已結束",
-    body: type === "trip_started" ? "對方已開啟家人共享，你可以查看 GeoClock 行程。" : "對方已結束這趟行程。",
+    title: type === "trip_started" ? "GeoClock 行程開始" : "GeoClock 行程結束",
+    body: type === "trip_started" ? "對方已開始一趟行程，你可以打開 GeoClock 查看狀態。" : "對方已結束這趟行程。",
     type,
     owner_code: trip.owner_code,
     share_code: trip.share_code,
@@ -156,9 +156,19 @@ async function insertEvent(
   });
 }
 
-async function getNotificationViewerCodes(ownerCode: string) {
+async function getNotificationViewerCodes(ownerCode: string, shareCode: string, type: "trip_started" | "trip_ended") {
   if (!supabase) {
     return [];
+  }
+
+  const { data: selectedRecipients } = await supabase
+    .from("trip_recipients")
+    .select("recipient_code")
+    .eq("share_code", shareCode)
+    .eq("can_receive_notifications", true);
+  const recipientCodes = ((selectedRecipients ?? []) as { recipient_code: string }[]).map((row) => row.recipient_code);
+  if (type === "trip_started") {
+    return Array.from(new Set(recipientCodes));
   }
 
   const { data } = await supabase
@@ -167,10 +177,11 @@ async function getNotificationViewerCodes(ownerCode: string) {
     .or(`user_a_code.eq.${ownerCode},user_b_code.eq.${ownerCode}`)
     .eq("status", "confirmed");
 
-  return ((data ?? []) as FamilyConnectionRow[])
+  const familyCodes = ((data ?? []) as FamilyConnectionRow[])
     .filter((connection) => {
       const ownerPermissions = connection.user_a_code === ownerCode ? connection.user_a_permissions : connection.user_b_permissions;
       return ownerPermissions?.can_receive_notifications === true;
     })
     .map((connection) => (connection.user_a_code === ownerCode ? connection.user_b_code : connection.user_a_code));
+  return Array.from(new Set([...recipientCodes, ...familyCodes]));
 }

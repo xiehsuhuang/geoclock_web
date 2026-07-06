@@ -40,12 +40,27 @@ export function clearGeoClockStorage() {
 }
 
 export function loadSnapshot() {
+  const destinations = readStored<Destination[]>(STORAGE_KEYS.destinations, []).map((destination, index) => ({
+    ...destination,
+    id: destination.id || createStorageId("destination", destination.createdAt, index)
+  }));
+  const family = readStored<FamilyMember[]>(STORAGE_KEYS.family, []).map((member, index) => ({
+    ...member,
+    id: member.id || createStorageId("family", member.createdAt, index)
+  }));
+
   return {
     user: readStored<UserProfile | null>(STORAGE_KEYS.user, null),
-    destinations: readStored<Destination[]>(STORAGE_KEYS.destinations, []),
-    family: readStored<FamilyMember[]>(STORAGE_KEYS.family, []),
+    destinations,
+    family,
     events: readStored<EventRecord[]>(STORAGE_KEYS.events, []),
     privacy: readStored<PrivacySettings>(STORAGE_KEYS.privacy, DEFAULT_PRIVACY_SETTINGS),
     tripSettings: readStored<TripSettings>(STORAGE_KEYS.tripSettings, DEFAULT_TRIP_SETTINGS)
   };
+}
+
+function createStorageId(prefix: string, stableValue: string | undefined, index: number) {
+  const base = stableValue ? new Date(stableValue).getTime() : Date.now();
+  const safeBase = Number.isFinite(base) ? base : Date.now();
+  return `${prefix}-${safeBase}-${index}`;
 }

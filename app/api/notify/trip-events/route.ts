@@ -21,6 +21,7 @@ type TripEventRow = {
   last_location_at: string | null;
   started_at: string | null;
   ended_at: string | null;
+  expires_at: string | null;
 };
 
 type PushSubscriptionRow = {
@@ -83,7 +84,7 @@ export async function POST(request: Request) {
   const query = supabase
     .from("trips")
     .select(
-      "id, share_code, owner_code, destination_name, alert_radius_m, arrival_radius_m, status, distance_m, last_location_at, started_at, ended_at"
+      "id, share_code, owner_code, destination_name, alert_radius_m, arrival_radius_m, status, distance_m, last_location_at, started_at, ended_at, expires_at"
     );
   const { data: tripData, error: tripError } = tripId
     ? await query.eq("id", tripId).maybeSingle()
@@ -99,6 +100,9 @@ export async function POST(request: Request) {
   const trip = tripData as TripEventRow;
   if (trip.ended_at || trip.status === "ended") {
     return NextResponse.json({ ...result, skippedReason: "trip_ended", skippedEndedCount: 1 });
+  }
+  if (trip.expires_at && Date.now() >= new Date(trip.expires_at).getTime()) {
+    return NextResponse.json({ ...result, skippedReason: "trip_expired", skippedEndedCount: 1 });
   }
 
   const targetEvents = getTargetEvents(trip);
@@ -179,6 +183,9 @@ function getTargetEvents(trip: TripEventRow): NotificationEventType[] {
   if (!startedAt || Number.isNaN(startedAt) || now - startedAt > MAX_ACTIVE_TRIP_AGE_MS) {
     return [];
   }
+  if (trip.expires_at && now >= new Date(trip.expires_at).getTime()) {
+    return [];
+  }
 
   const events: NotificationEventType[] = [];
   const alertRadiusMeters = trip.alert_radius_m ?? 500;
@@ -222,7 +229,41 @@ async function getRecipients(trip: TripEventRow): Promise<Recipient[]> {
     })) satisfies Recipient[];
 
   const familyRecipients = await getFamilyRecipients(trip.owner_code);
-  return dedupeRecipients([...baseRecipients, ...familyRecipients]);
+  const selectedRecipients = await getTripSelectedRecipients(trip.share_code);
+  return dedupeRecipients([...baseRecipients, ...familyRecipients, ...selectedRecipients]);
+}
+
+async function getTripSelectedRecipients(shareCode: string): Promise<Recipient[]> {
+  if (!supabase) {
+    return [];
+  }
+
+  const { data: recipients } = await supabase
+    .from("trip_recipients")
+    .select("recipient_code")
+    .eq("share_code", shareCode)
+    .eq("can_receive_notifications", true);
+  const codes = ((recipients ?? []) as { recipient_code: string }[]).map((row) => row.recipient_code);
+  if (codes.length === 0) {
+    return [];
+  }
+
+  const { data: subscriptions } = await supabase
+    .from("push_subscriptions")
+    .select("role, user_code, share_code, endpoint, p256dh, auth")
+    .in("user_code", codes);
+
+  return ((subscriptions ?? []) as PushSubscriptionRow[])
+    .filter((subscription) => subscription.endpoint && subscription.p256dh && subscription.auth)
+    .map((subscription) => ({
+      role: "viewer",
+      code: subscription.user_code,
+      endpoint: subscription.endpoint,
+      subscription: {
+        ...subscription,
+        role: "viewer"
+      }
+    }));
 }
 
 async function getFamilyRecipients(ownerCode: string): Promise<Recipient[]> {

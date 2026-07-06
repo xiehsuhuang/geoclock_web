@@ -1,65 +1,247 @@
 import { NextResponse } from "next/server";
 import { supabase } from "@/lib/supabaseClient";
 
+type FamilyPermissions = {
+  can_view_status?: boolean;
+  can_view_approx_location?: boolean;
+  can_view_precise_location?: boolean;
+  can_receive_notifications?: boolean;
+  can_wake_me?: boolean;
+  can_view_destination?: boolean;
+};
+
 type FamilyConnectionRow = {
   user_a_code: string;
   user_b_code: string;
-  user_a_permissions: Record<string, boolean>;
-  user_b_permissions: Record<string, boolean>;
+  user_a_permissions: FamilyPermissions | null;
+  user_b_permissions: FamilyPermissions | null;
   status: string;
 };
 
+type TripRow = {
+  id: string;
+  share_code: string;
+  owner_code: string;
+  started_at: string;
+  ended_at: string | null;
+  expires_at?: string | null;
+  [key: string]: unknown;
+};
+
+const ACTIVE_TRIP_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export async function GET(request: Request) {
   if (!supabase) {
-    return NextResponse.json({ ok: false, error: "Supabase 環境變數未設定。", trips: [] }, { status: 503 });
+    return NextResponse.json({ ok: false, error: "Supabase 環境變數未設定。", trips: [], families: [] }, { status: 503 });
   }
 
-  const code = new URL(request.url).searchParams.get("code")?.trim().toUpperCase();
-  if (!code) {
-    return NextResponse.json({ ok: false, error: "缺少 code。", trips: [] }, { status: 400 });
+  const url = new URL(request.url);
+  const viewerCode = (url.searchParams.get("viewer_code") ?? url.searchParams.get("code"))?.trim().toUpperCase();
+  const ownerCode = url.searchParams.get("owner_code")?.trim().toUpperCase();
+  const shareCode = url.searchParams.get("share_code")?.trim();
+
+  if (!viewerCode) {
+    return NextResponse.json({ ok: false, error: "缺少 viewer_code。", trips: [], families: [] }, { status: 400 });
   }
 
   const { data: connections, error: connectionError } = await supabase
     .from("family_connections")
     .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions,status")
-    .or(`user_a_code.eq.${code},user_b_code.eq.${code}`)
+    .or(`user_a_code.eq.${viewerCode},user_b_code.eq.${viewerCode}`)
     .eq("status", "confirmed");
 
   if (connectionError) {
-    return NextResponse.json({ ok: false, error: connectionError.message, trips: [] }, { status: 500 });
+    return NextResponse.json({ ok: false, error: connectionError.message, trips: [], families: [] }, { status: 500 });
   }
 
   const rows = (connections ?? []) as FamilyConnectionRow[];
-  const familyCodes = rows.map((row) => (row.user_a_code === code ? row.user_b_code : row.user_a_code));
-  if (familyCodes.length === 0) {
-    return NextResponse.json({ ok: true, trips: [] });
+
+  if (ownerCode) {
+    return getSingleFamilyTrip({
+      ownerCode,
+      rows,
+      shareCode,
+      viewerCode
+    });
   }
 
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const familyCodes = rows.map((row) => getOtherCode(row, viewerCode));
+  if (familyCodes.length === 0) {
+    return NextResponse.json({ ok: true, trips: [], families: [] });
+  }
+
+  const since = new Date(Date.now() - ACTIVE_TRIP_WINDOW_MS).toISOString();
+  const nowIso = new Date().toISOString();
   const { data: trips, error: tripsError } = await supabase
     .from("trips")
     .select("*")
     .in("owner_code", familyCodes)
     .is("ended_at", null)
     .gte("started_at", since)
+    .or(`expires_at.is.null,expires_at.gt.${nowIso}`)
     .order("started_at", { ascending: false });
 
   if (tripsError) {
-    return NextResponse.json({ ok: false, error: tripsError.message, trips: [] }, { status: 500 });
+    return NextResponse.json({ ok: false, error: tripsError.message, trips: [], families: [] }, { status: 500 });
   }
 
-  const decoratedTrips = (trips ?? []).map((trip) => {
-    const connection = rows.find((row) => row.user_a_code === trip.owner_code || row.user_b_code === trip.owner_code);
-    const permissions = connection
-      ? connection.user_a_code === trip.owner_code
-        ? connection.user_a_permissions
-        : connection.user_b_permissions
-      : {};
+  const tripRows = (trips ?? []) as TripRow[];
+  const latestTripByOwner = new Map<string, TripRow>();
+  for (const trip of tripRows) {
+    if (!latestTripByOwner.has(trip.owner_code)) {
+      latestTripByOwner.set(trip.owner_code, trip);
+    }
+  }
+
+  const families = rows.map((connection) => {
+    const familyCode = getOtherCode(connection, viewerCode);
+    const permissions = getOwnerGrantedPermissions(connection, familyCode);
+    const trip = latestTripByOwner.get(familyCode);
     return {
-      ...trip,
-      permissions
+      owner_code: familyCode,
+      connection_status: connection.status,
+      permissions,
+      trip: trip ? decorateTrip(trip, permissions) : null
     };
   });
 
-  return NextResponse.json({ ok: true, trips: decoratedTrips });
+  return NextResponse.json({
+    ok: true,
+    trips: families.map((family) => family.trip).filter(Boolean),
+    families
+  });
+}
+
+async function getSingleFamilyTrip({
+  ownerCode,
+  rows,
+  shareCode,
+  viewerCode
+}: {
+  ownerCode: string;
+  rows: FamilyConnectionRow[];
+  shareCode?: string;
+  viewerCode: string;
+}) {
+  if (!supabase) {
+    return NextResponse.json({ ok: false, error: "Supabase 環境變數未設定。", trips: [], families: [] }, { status: 503 });
+  }
+
+  const connection = rows.find((row) => getOtherCode(row, viewerCode) === ownerCode);
+  const recipientPermission = await getTripRecipientPermission(ownerCode, viewerCode);
+  const permissions = connection
+    ? getOwnerGrantedPermissions(connection, ownerCode)
+    : recipientPermission
+      ? getRecipientDefaultPermissions()
+      : {};
+  const connectedCanView = Boolean(connection && permissions.can_view_status !== false);
+  const recipientCanView = Boolean(recipientPermission?.can_view);
+
+  if (!connectedCanView && !recipientCanView && !shareCode) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "你尚未與這位家人完成連線。請先互相加入代號，或請對方提供行程分享連結。",
+        trips: [],
+        families: []
+      },
+      { status: 403 }
+    );
+  }
+
+  const since = new Date(Date.now() - ACTIVE_TRIP_WINDOW_MS).toISOString();
+  const nowIso = new Date().toISOString();
+  let query = supabase.from("trips").select("*").eq("owner_code", ownerCode);
+
+  if (shareCode) {
+    query = query.eq("share_code", shareCode);
+  } else {
+    query = query.is("ended_at", null).gte("started_at", since).or(`expires_at.is.null,expires_at.gt.${nowIso}`);
+  }
+
+  const { data, error } = await query.order("started_at", { ascending: false }).limit(1).maybeSingle();
+  if (error) {
+    return NextResponse.json({ ok: false, error: error.message, trips: [], families: [] }, { status: 500 });
+  }
+
+  if (!data) {
+    return NextResponse.json({
+      ok: true,
+      message: "這位家人目前沒有進行中的行程。",
+      trips: [],
+      families: [
+        {
+          owner_code: ownerCode,
+          connection_status: connection?.status ?? "not_connected",
+          permissions,
+          trip: null
+        }
+      ]
+    });
+  }
+
+  const trip = decorateTrip(data as TripRow, permissions);
+  return NextResponse.json({
+    ok: true,
+    trips: [trip],
+    trip,
+    families: [
+      {
+        owner_code: ownerCode,
+        connection_status: connection?.status ?? "share_code",
+        permissions,
+        trip
+      }
+    ]
+  });
+}
+
+function getOtherCode(connection: FamilyConnectionRow, viewerCode: string) {
+  return connection.user_a_code === viewerCode ? connection.user_b_code : connection.user_a_code;
+}
+
+function getOwnerGrantedPermissions(connection: FamilyConnectionRow, ownerCode: string): FamilyPermissions {
+  return ownerCode === connection.user_a_code ? connection.user_a_permissions ?? {} : connection.user_b_permissions ?? {};
+}
+
+async function getTripRecipientPermission(ownerCode: string, viewerCode: string) {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data } = await supabase
+    .from("trip_recipients")
+    .select("can_view,can_receive_notifications")
+    .eq("owner_code", ownerCode)
+    .eq("recipient_code", viewerCode)
+    .eq("can_view", true)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data as { can_view: boolean; can_receive_notifications: boolean } | null;
+}
+
+function getRecipientDefaultPermissions(): FamilyPermissions {
+  return {
+    can_view_status: true,
+    can_view_approx_location: true,
+    can_view_precise_location: false,
+    can_receive_notifications: true,
+    can_wake_me: false,
+    can_view_destination: true
+  };
+}
+
+function decorateTrip(trip: TripRow, permissions: FamilyPermissions) {
+  return {
+    ...trip,
+    permissions,
+    destination_name: permissions.can_view_destination === false ? "已隱藏" : trip.destination_name,
+    destination_address: permissions.can_view_destination === false ? "" : trip.destination_address,
+    current_lat: permissions.can_view_precise_location ? trip.current_lat : null,
+    current_lng: permissions.can_view_precise_location ? trip.current_lng : null,
+    approximate_lat: permissions.can_view_approx_location === false && !permissions.can_view_precise_location ? null : trip.approximate_lat,
+    approximate_lng: permissions.can_view_approx_location === false && !permissions.can_view_precise_location ? null : trip.approximate_lng
+  };
 }

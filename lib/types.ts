@@ -150,6 +150,8 @@ export type CloudTripRow = {
   last_location_at: string | null;
   started_at: string;
   ended_at: string | null;
+  expires_at?: string | null;
+  duration_minutes?: number | null;
 };
 
 export type NotificationDiagnostic = {
