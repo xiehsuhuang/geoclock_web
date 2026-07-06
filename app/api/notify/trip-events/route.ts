@@ -28,6 +28,13 @@ type PushSubscriptionRow = {
   auth: string;
 };
 
+type FamilyConnectionRow = {
+  user_a_code: string;
+  user_b_code: string;
+  user_a_permissions: Record<string, boolean>;
+  user_b_permissions: Record<string, boolean>;
+};
+
 type NotificationEventType = "near_destination" | "arrived" | "location_lost";
 
 const LOCATION_LOST_THRESHOLD_MS = 60_000;
@@ -95,10 +102,12 @@ export async function POST(request: Request) {
   const rows = ((subscriptions ?? []) as PushSubscriptionRow[]).filter(
     (subscription) => subscription.role === "owner" || subscription.role === "viewer"
   );
+  const familyRows = await getFamilySubscriptions(trip.owner_code);
+  const allRows = dedupeSubscriptions([...rows, ...familyRows]);
 
   for (const eventType of targetEvents) {
     await insertNotificationRecord(trip, eventType);
-    for (const subscription of rows) {
+    for (const subscription of allRows) {
       const role = subscription.role === "owner" ? "owner" : "viewer";
       const muted = await isMuted({
         shareCode: trip.share_code,
@@ -137,6 +146,50 @@ export async function POST(request: Request) {
   }
 
   return NextResponse.json(diagnostics);
+}
+
+async function getFamilySubscriptions(ownerCode: string): Promise<PushSubscriptionRow[]> {
+  if (!supabase) {
+    return [];
+  }
+
+  const { data: connections } = await supabase
+    .from("family_connections")
+    .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions")
+    .or(`user_a_code.eq.${ownerCode},user_b_code.eq.${ownerCode}`)
+    .eq("status", "confirmed");
+
+  const viewerCodes = ((connections ?? []) as FamilyConnectionRow[])
+    .filter((connection) => {
+      const ownerPermissions = connection.user_a_code === ownerCode ? connection.user_a_permissions : connection.user_b_permissions;
+      return ownerPermissions?.can_receive_notifications === true;
+    })
+    .map((connection) => (connection.user_a_code === ownerCode ? connection.user_b_code : connection.user_a_code));
+
+  if (viewerCodes.length === 0) {
+    return [];
+  }
+
+  const { data: subscriptions } = await supabase
+    .from("push_subscriptions")
+    .select("role, user_code, endpoint, p256dh, auth")
+    .in("user_code", viewerCodes);
+
+  return ((subscriptions ?? []) as PushSubscriptionRow[]).map((subscription) => ({
+    ...subscription,
+    role: "viewer"
+  }));
+}
+
+function dedupeSubscriptions(rows: PushSubscriptionRow[]) {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.endpoint)) {
+      return false;
+    }
+    seen.add(row.endpoint);
+    return true;
+  });
 }
 
 function getTargetEvents(trip: TripEventRow): NotificationEventType[] {

@@ -57,6 +57,24 @@ const PERMISSIONS: { label: string; value: FamilyPermission }[] = [
   { label: "可呼叫我", value: "wake" }
 ];
 
+const DEFAULT_FAMILY_CONNECTION_PERMISSIONS: FamilyPermissions = {
+  can_view_status: true,
+  can_view_approx_location: true,
+  can_view_precise_location: false,
+  can_receive_notifications: true,
+  can_wake_me: true,
+  can_view_destination: true
+};
+
+const FAMILY_PERMISSION_OPTIONS: { key: keyof FamilyPermissions; label: string }[] = [
+  { key: "can_view_status", label: "看得到我是否正在行程中" },
+  { key: "can_view_approx_location", label: "看得到我的粗略位置" },
+  { key: "can_view_precise_location", label: "看得到我的精準位置" },
+  { key: "can_receive_notifications", label: "收到開始 / 快到 / 抵達 / 結束通知" },
+  { key: "can_wake_me", label: "可以呼叫我" },
+  { key: "can_view_destination", label: "看得到目的地名稱" }
+];
+
 type PreflightStatus = "尚未測試" | "測試中" | "成功" | "失敗" | "不支援";
 
 type PreflightCheckState = {
@@ -119,6 +137,41 @@ type CloudShareState = {
   shareUrl?: string;
 };
 
+type HomeMode = "start" | "view" | "family";
+
+type FamilyConnectionRow = {
+  id: string;
+  user_a_code: string;
+  user_b_code: string;
+  user_a_permissions: FamilyPermissions;
+  user_b_permissions: FamilyPermissions;
+  user_a_confirmed: boolean;
+  user_b_confirmed: boolean;
+  status: string;
+  updated_at?: string;
+};
+
+type FamilyPermissions = {
+  can_view_status: boolean;
+  can_view_approx_location: boolean;
+  can_view_precise_location: boolean;
+  can_receive_notifications: boolean;
+  can_wake_me: boolean;
+  can_view_destination: boolean;
+};
+
+type FamilyTripRow = CloudTripRow & {
+  permissions?: Partial<FamilyPermissions>;
+};
+
+type PreflightCheckResult = {
+  key: string;
+  label: string;
+  status: "success" | "warning" | "failed";
+  message: string;
+  suggestion: string;
+};
+
 type NotificationState = {
   status: "尚未啟用" | "已啟用" | "被拒絕" | "此瀏覽器不支援";
   message: string;
@@ -135,6 +188,7 @@ const emptyDestinationForm: DestinationFormState = {
 
 export default function Home() {
   const [hydrated, setHydrated] = useState(false);
+  const [homeMode, setHomeMode] = useState<HomeMode>("start");
   const [user, setUser] = useState<UserProfile | null>(null);
   const [nicknameInput, setNicknameInput] = useState("");
   const [destinations, setDestinations] = useState<Destination[]>([]);
@@ -155,6 +209,13 @@ export default function Home() {
   const [family, setFamily] = useState<FamilyMember[]>([]);
   const [familyCode, setFamilyCode] = useState("");
   const [familyPermission, setFamilyPermission] = useState<FamilyPermission>("status_only");
+  const [connectionCode, setConnectionCode] = useState("");
+  const [connectionPermissions, setConnectionPermissions] = useState<FamilyPermissions>(DEFAULT_FAMILY_CONNECTION_PERMISSIONS);
+  const [familyConnections, setFamilyConnections] = useState<FamilyConnectionRow[]>([]);
+  const [familyTrips, setFamilyTrips] = useState<FamilyTripRow[]>([]);
+  const [familyConnectionMessage, setFamilyConnectionMessage] = useState("");
+  const [preflightResults, setPreflightResults] = useState<PreflightCheckResult[]>([]);
+  const [preflightSummary, setPreflightSummary] = useState("");
   const [viewerShareCode, setViewerShareCode] = useState("");
   const [viewerCodeInput, setViewerCodeInput] = useState("");
   const [viewerEntryMessage, setViewerEntryMessage] = useState("");
@@ -254,6 +315,16 @@ export default function Home() {
     window.localStorage.setItem(VIEWER_CODE_STORAGE_KEY, nextViewerCode);
     setViewerCodeInput(nextViewerCode);
   }, [hydrated]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+
+    void ensureCloudUser(user);
+    void loadFamilyConnections(user.code);
+    void loadFamilyTrips(user.code);
+  }, [user]);
 
   useEffect(() => {
     if (!hydrated) {
@@ -1013,6 +1084,7 @@ export default function Home() {
         shareUrl
       });
       appendEvent("開啟家人共享", `分享連結已建立：${shareUrl}`);
+      void notifyFamilyTripEvent(data.share_code, "trip_started");
     } catch {
       setCloudShare({
         status: "error",
@@ -1061,6 +1133,125 @@ export default function Home() {
     }
     const query = viewerCode ? `?viewer=${encodeURIComponent(viewerCode)}` : "";
     window.location.href = `/share/${encodeURIComponent(shareCode)}${query}`;
+  }
+
+  async function ensureCloudUser(profile: UserProfile) {
+    if (!supabase) {
+      return;
+    }
+    await supabase.from("users").upsert(
+      {
+        display_name: profile.nickname,
+        user_code: profile.code
+      },
+      { ignoreDuplicates: true, onConflict: "user_code" }
+    );
+  }
+
+  async function loadFamilyConnections(code: string) {
+    try {
+      const response = await fetch(`/api/family/list?code=${encodeURIComponent(code)}`);
+      const payload = (await response.json()) as { connections?: FamilyConnectionRow[]; error?: string };
+      setFamilyConnections(payload.connections ?? []);
+      if (payload.error) {
+        setFamilyConnectionMessage(payload.error);
+      }
+    } catch (error) {
+      setFamilyConnectionMessage(error instanceof Error ? error.message : "家人連線讀取失敗");
+    }
+  }
+
+  async function loadFamilyTrips(code: string) {
+    try {
+      const response = await fetch(`/api/family/trips?code=${encodeURIComponent(code)}`);
+      const payload = (await response.json()) as { trips?: FamilyTripRow[] };
+      setFamilyTrips(payload.trips ?? []);
+    } catch {
+      setFamilyTrips([]);
+    }
+  }
+
+  async function connectFamily(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!user) {
+      return;
+    }
+    const code = connectionCode.trim().toUpperCase();
+    if (!code || code === user.code) {
+      setFamilyConnectionMessage("請輸入有效的家人代號。");
+      return;
+    }
+
+    const response = await fetch("/api/family/connect", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        my_code: user.code,
+        family_code: code,
+        permissions: connectionPermissions
+      })
+    });
+    const payload = (await response.json()) as { ok?: boolean; error?: string };
+    setFamilyConnectionMessage(payload.ok ? "已送出家人連線，等待雙方確認。" : payload.error ?? "家人連線失敗");
+    if (payload.ok) {
+      setConnectionCode("");
+      void loadFamilyConnections(user.code);
+    }
+  }
+
+  async function disconnectFamily(code: string) {
+    if (!user) {
+      return;
+    }
+    await fetch("/api/family/disconnect", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        my_code: user.code,
+        family_code: code
+      })
+    });
+    void loadFamilyConnections(user.code);
+  }
+
+  async function runPreflightAll() {
+    if (!user) {
+      return;
+    }
+
+    const results: PreflightCheckResult[] = [
+      getHttpsPwaCheck(),
+      await getLocationPreflightCheck(),
+      await getSoundPreflightCheck(),
+      getWebPushPreflightCheck(),
+      await getServiceWorkerPreflightCheck(),
+      await getPushSubscriptionPreflightCheck(),
+      getWakeLockPreflightCheck(),
+      getVibrationPreflightCheck()
+    ];
+
+    try {
+      const response = await fetch(`/api/preflight/check-all?code=${encodeURIComponent(user.code)}`);
+      const payload = (await response.json()) as { checks?: PreflightCheckResult[] };
+      results.push(...(payload.checks ?? []));
+    } catch {
+      results.push({
+        key: "serverPreflight",
+        label: "伺服器檢查",
+        status: "warning",
+        message: "伺服器檢查暫時無法完成。",
+        suggestion: "仍可開始行程，但家人通知可能需要手動確認。"
+      });
+    }
+
+    const failed = results.filter((item) => item.status === "failed").length;
+    const warnings = results.filter((item) => item.status === "warning").length;
+    setPreflightResults(results);
+    setPreflightSummary(failed > 0 ? "有項目失敗，若 GPS 不可用請先修正。" : warnings > 0 ? "部分功能可能無法使用，仍可開始行程。" : "行前檢查完成。");
   }
 
   async function syncCloudTrip({
@@ -1191,6 +1382,26 @@ export default function Home() {
     }
 
     appendEvent("停止家人共享", "雲端共享行程已標記結束");
+    if (share.shareCode) {
+      void notifyFamilyTripEvent(share.shareCode, "trip_ended");
+    }
+  }
+
+  async function notifyFamilyTripEvent(shareCode: string, type: "trip_started" | "trip_ended") {
+    try {
+      await fetch("/api/notify/family-trip", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          share_code: shareCode,
+          type
+        })
+      });
+    } catch {
+      // 家人通知失敗不影響本機行程。
+    }
   }
 
   async function enableNotifications() {
@@ -1508,11 +1719,31 @@ export default function Home() {
       </header>
 
       <section className="card">
+        <p className="eyebrow">首頁模式</p>
+        <div className="mode-switch">
+          <button className={homeMode === "start" ? "selected" : ""} onClick={() => setHomeMode("start")} type="button">
+            我要開始行程
+            <span>目的地、距離設定、行前檢查、開始行程</span>
+          </button>
+          <button className={homeMode === "view" ? "selected" : ""} onClick={() => setHomeMode("view")} type="button">
+            我要查看家人行程
+            <span>已連線家人、進行中行程、查看 / 呼叫</span>
+          </button>
+          <button className={homeMode === "family" ? "selected" : ""} onClick={() => setHomeMode("family")} type="button">
+            家人連線設定
+            <span>我的代號、輸入家人代號、選權限、雙方確認</span>
+          </button>
+        </div>
+      </section>
+
+      {homeMode === "view" ? (
+      <section className="card">
         <p className="eyebrow">入口</p>
         <div className="entry-tabs">
-          <span>我要開始行程</span>
-          <span>我是家人，輸入行程代碼查看</span>
+          <span>已連線家人</span>
+          <span>備用：輸入行程代碼查看</span>
         </div>
+        <FamilyTripsPanel trips={familyTrips} onRefresh={() => user && void loadFamilyTrips(user.code)} />
         <form className="viewer-entry" onSubmit={openViewerTrip}>
           <label>
             行程代碼
@@ -1528,6 +1759,7 @@ export default function Home() {
           {viewerEntryMessage ? <p className="warning">{viewerEntryMessage}</p> : null}
         </form>
       </section>
+      ) : null}
 
       {strongAlert ? (
         <section className="alert-panel" role="alert">
@@ -1545,6 +1777,8 @@ export default function Home() {
         </section>
       ) : null}
 
+      {homeMode === "start" ? (
+      <>
       <section className="grid">
         <article className="card profile-card">
           <div>
@@ -1797,6 +2031,17 @@ export default function Home() {
         </div>
       </section>
 
+      <section className="card">
+        <p className="eyebrow">行前檢查</p>
+        <h2>一鍵測試所有</h2>
+        <p className="notice">部分功能可能無法使用時仍可開始行程；如果 GPS 完全不可用，請先修正定位設定。</p>
+        <button className="primary-button" onClick={runPreflightAll} type="button">
+          一鍵測試所有
+        </button>
+        {preflightSummary ? <p className="form-notice">{preflightSummary}</p> : null}
+        {preflightResults.length > 0 ? <PreflightResultList items={preflightResults} /> : null}
+      </section>
+
       {preflightOpen && preflightDestination ? (
         <section className="card preflight-card">
           <div className="section-heading">
@@ -1899,8 +2144,74 @@ export default function Home() {
           {cloudShare.message ? <p className={cloudShare.status === "error" ? "inline-status warning" : "inline-status good"}>{cloudShare.message}</p> : null}
         </section>
       ) : null}
+      </>
+      ) : null}
 
+      {homeMode === "family" ? (
       <section className="grid">
+        <article className="card">
+          <p className="eyebrow">家人連線設定</p>
+          <h2>我的代號</h2>
+          <p className="big-code">{user.code}</p>
+          <p className="notice">把你的代號給家人，雙方互相加入後，就能自動共享行程。</p>
+          <button className="secondary-button" onClick={() => navigator.clipboard.writeText(user.code)} type="button">
+            複製我的代號
+          </button>
+          <form className="stack" onSubmit={connectFamily}>
+            <label>
+              輸入家人代號
+              <input value={connectionCode} onChange={(event) => setConnectionCode(event.target.value.toUpperCase())} placeholder="例如：AMOM-2048" />
+            </label>
+            <div className="permission-grid">
+              {FAMILY_PERMISSION_OPTIONS.map((option) => (
+                <label className="toggle-row" key={option.key}>
+                  <input
+                    checked={connectionPermissions[option.key]}
+                    onChange={(event) =>
+                      setConnectionPermissions((current) => ({
+                        ...current,
+                        [option.key]: event.target.checked
+                      }))
+                    }
+                    type="checkbox"
+                  />
+                  <span>{option.label}</span>
+                </label>
+              ))}
+            </div>
+            <button className="primary-button" type="submit">
+              加入家人
+            </button>
+          </form>
+          {familyConnectionMessage ? <p className="form-notice">{familyConnectionMessage}</p> : null}
+        </article>
+
+        <article className="card">
+          <p className="eyebrow">已連線家人</p>
+          {familyConnections.length === 0 ? (
+            <p className="muted">尚未建立家人連線。</p>
+          ) : (
+            <div className="family-list">
+              {familyConnections.map((connection) => {
+                const otherCode = connection.user_a_code === user.code ? connection.user_b_code : connection.user_a_code;
+                const myPermissions = connection.user_a_code === user.code ? connection.user_a_permissions : connection.user_b_permissions;
+                return (
+                  <div className="family-row" key={connection.id}>
+                    <div>
+                      <strong>{otherCode}</strong>
+                      <span>{getConnectionStatusLabel(connection)}</span>
+                      <p className="field-hint">{formatPermissionSummary(myPermissions)}</p>
+                    </div>
+                    <button className="danger-button" onClick={() => disconnectFamily(otherCode)} type="button">
+                      解除
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </article>
+
         <article className="card">
           <p className="eyebrow">家人協助叫醒</p>
           <form className="stack" onSubmit={addFamilyMember}>
@@ -1967,6 +2278,7 @@ export default function Home() {
           )}
         </article>
       </section>
+      ) : null}
 
       <section className="card">
         <div className="section-heading">
@@ -2027,6 +2339,57 @@ function DiagnosticList({ items }: { items: NotificationDiagnostic[] }) {
   );
 }
 
+function PreflightResultList({ items }: { items: PreflightCheckResult[] }) {
+  return (
+    <div className="diagnostic-list">
+      {items.map((item) => (
+        <div className="diagnostic-row" key={item.key}>
+          <div>
+            <span>{item.label}</span>
+            <strong className={item.status === "success" ? "good" : item.status === "warning" ? "warning" : "warning"}>{item.message}</strong>
+            {item.suggestion ? <p className="field-hint">{item.suggestion}</p> : null}
+          </div>
+          <strong>{item.status === "success" ? "成功" : item.status === "warning" ? "警告" : "失敗"}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FamilyTripsPanel({ onRefresh, trips }: { onRefresh: () => void; trips: FamilyTripRow[] }) {
+  return (
+    <div className="stack">
+      <div className="section-heading">
+        <div>
+          <h2>進行中行程</h2>
+          <p className="muted">只列出已雙方確認、最近 24 小時內且尚未結束的家人行程。</p>
+        </div>
+        <button className="secondary-button small-button" onClick={onRefresh} type="button">
+          重新整理
+        </button>
+      </div>
+      {trips.length === 0 ? (
+        <p className="muted">目前沒有進行中的行程。</p>
+      ) : (
+        <div className="family-list">
+          {trips.map((trip) => (
+            <div className="family-row" key={trip.id}>
+              <div>
+                <strong>{trip.owner_code}</strong>
+                <span>{trip.status}</span>
+                <p className="field-hint">最近更新：{formatTime(trip.last_location_at ?? undefined)}</p>
+              </div>
+              <button className="primary-button" onClick={() => (window.location.href = `/share/${trip.share_code}`)} type="button">
+                查看 / 呼叫
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PreflightRow({
   actionLabel,
   detail,
@@ -2054,6 +2417,154 @@ function PreflightRow({
   );
 }
 
+function getHttpsPwaCheck(): PreflightCheckResult {
+  const secure = window.location.protocol === "https:" || window.location.hostname === "localhost";
+  const standalone = window.matchMedia("(display-mode: standalone)").matches || ("standalone" in navigator && Boolean(navigator.standalone));
+  if (!secure) {
+    return {
+      key: "https",
+      label: "HTTPS / PWA 狀態",
+      status: "failed",
+      message: "目前不是 HTTPS。",
+      suggestion: "請部署到 Vercel HTTPS 測試，iPhone Safari 可能不允許定位與通知。"
+    };
+  }
+  return {
+    key: "https",
+    label: "HTTPS / PWA 狀態",
+    status: standalone ? "success" : "warning",
+    message: standalone ? "已從 PWA / 主畫面開啟。" : "目前不是 standalone PWA。",
+    suggestion: standalone ? "" : "iPhone Web Push 通常需要加入主畫面並從主畫面開啟。"
+  };
+}
+
+async function getLocationPreflightCheck(): Promise<PreflightCheckResult> {
+  if (!("geolocation" in navigator)) {
+    return {
+      key: "location",
+      label: "定位權限與 GPS",
+      status: "failed",
+      message: "此瀏覽器不支援定位。",
+      suggestion: "請改用支援定位的瀏覽器或確認 HTTPS。"
+    };
+  }
+
+  return new Promise((resolve) => {
+    navigator.geolocation.getCurrentPosition(
+      () =>
+        resolve({
+          key: "location",
+          label: "定位權限與 GPS",
+          status: "success",
+          message: "定位可用。",
+          suggestion: ""
+        }),
+      (error) =>
+        resolve({
+          key: "location",
+          label: "定位權限與 GPS",
+          status: "failed",
+          message: getGeolocationFailureMessage(error),
+          suggestion: "請到 Safari 網站設定允許定位，或到戶外再試。"
+        }),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+    );
+  });
+}
+
+async function getSoundPreflightCheck(): Promise<PreflightCheckResult> {
+  const unlocked = await unlockAlertSound();
+  if (!unlocked.ok) {
+    return {
+      key: "sound",
+      label: "提示音解鎖",
+      status: "failed",
+      message: unlocked.error ?? "提示音解鎖失敗。",
+      suggestion: "請點測試提示音，並確認 iPhone 不是靜音模式。"
+    };
+  }
+  await playAlertSoundFor(1000);
+  return {
+    key: "sound",
+    label: "提示音解鎖",
+    status: "success",
+    message: "提示音已解鎖並播放 1 秒測試音。",
+    suggestion: ""
+  };
+}
+
+function getWebPushPreflightCheck(): PreflightCheckResult {
+  const supported = "Notification" in window && "PushManager" in window;
+  if (!supported) {
+    return {
+      key: "webPush",
+      label: "Web Push 支援與通知權限",
+      status: "failed",
+      message: "此瀏覽器不支援 Web Push。",
+      suggestion: "iPhone 請加入主畫面並從主畫面開啟。"
+    };
+  }
+  return {
+    key: "webPush",
+    label: "Web Push 支援與通知權限",
+    status: Notification.permission === "granted" ? "success" : "failed",
+    message: `通知權限：${Notification.permission}`,
+    suggestion: Notification.permission === "granted" ? "" : "請按啟用通知，背景通知可能才會送達。"
+  };
+}
+
+async function getServiceWorkerPreflightCheck(): Promise<PreflightCheckResult> {
+  if (!("serviceWorker" in navigator)) {
+    return {
+      key: "serviceWorker",
+      label: "Service Worker 註冊",
+      status: "failed",
+      message: "此瀏覽器不支援 Service Worker。",
+      suggestion: "請使用支援 PWA 的瀏覽器。"
+    };
+  }
+  const registration = await navigator.serviceWorker.register("/sw.js").catch(() => null);
+  return {
+    key: "serviceWorker",
+    label: "Service Worker 註冊",
+    status: registration ? "success" : "failed",
+    message: registration ? "Service Worker 已註冊。" : "Service Worker 註冊失敗。",
+    suggestion: registration ? "" : "請確認網站是 HTTPS 並重新載入。"
+  };
+}
+
+async function getPushSubscriptionPreflightCheck(): Promise<PreflightCheckResult> {
+  const registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration().catch(() => undefined) : undefined;
+  const subscription = await registration?.pushManager.getSubscription().catch(() => null);
+  return {
+    key: "pushSubscription",
+    label: "PushSubscription 是否取得",
+    status: subscription ? "success" : "warning",
+    message: subscription ? "已取得 PushSubscription。" : "尚未取得 PushSubscription。",
+    suggestion: subscription ? "" : "請先啟用通知。"
+  };
+}
+
+function getWakeLockPreflightCheck(): PreflightCheckResult {
+  return {
+    key: "wakeLock",
+    label: "防鎖屏 Wake Lock 支援",
+    status: "wakeLock" in navigator ? "success" : "warning",
+    message: "wakeLock" in navigator ? "支援防鎖屏。" : "此瀏覽器不支援防鎖屏。",
+    suggestion: "wakeLock" in navigator ? "" : "請保持畫面開啟。"
+  };
+}
+
+function getVibrationPreflightCheck(): PreflightCheckResult {
+  return {
+    key: "vibration",
+    label: "震動支援",
+    status: "vibrate" in navigator ? "success" : "warning",
+    message: "vibrate" in navigator ? "支援震動。" : "此瀏覽器不支援網頁震動。",
+    suggestion: "vibrate" in navigator ? "" : "iPhone Safari 常見此限制。"
+  };
+}
+
 function createId(prefix: string) {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -2072,6 +2583,24 @@ function createFamilyViewerCode() {
 
 function getFamilyPermissionLabel(permission: string) {
   return PERMISSIONS.find((item) => item.value === permission)?.label ?? permission;
+}
+
+function getConnectionStatusLabel(connection: FamilyConnectionRow) {
+  if (connection.status === "confirmed") {
+    return "已連線";
+  }
+  if (connection.status === "blocked") {
+    return "已封鎖 / 已停用";
+  }
+  return "等待對方確認";
+}
+
+function formatPermissionSummary(permissions: Partial<FamilyPermissions> | undefined) {
+  if (!permissions) {
+    return "尚未設定權限";
+  }
+  const enabled = FAMILY_PERMISSION_OPTIONS.filter((option) => permissions[option.key]).map((option) => option.label);
+  return enabled.length > 0 ? enabled.join("、") : "未授權功能";
 }
 
 function getSafeArrivalRadius(arrivalRadius: number, alertRadius: number) {
