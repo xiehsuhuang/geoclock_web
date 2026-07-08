@@ -60,12 +60,12 @@ export async function POST(request: Request) {
   if (tripError || !trip) {
     return NextResponse.json({ message: `找不到行程代碼：${shareCode}。`, diagnostics: emptyDiagnostics }, { status: 404 });
   }
-  if (!canWakeOwner(trip)) {
+  if (!canWakeOwner(trip) || !isWakeableTripStatus(trip.status)) {
     return NextResponse.json(
       {
         ok: false,
-        error: "這趟行程已結束或已失效，不能再呼叫對方。",
-        message: "這趟行程已結束或已失效，不能再呼叫對方。",
+        error: "這趟行程已結束，不能再呼叫對方。",
+        message: "這趟行程已結束，不能再呼叫對方。",
         diagnostics: emptyDiagnostics
       },
       { status: 409 }
@@ -250,4 +250,20 @@ async function canViewerWakeOwner(ownerCode: string, viewerCode: string) {
       ? (data.user_a_permissions as { can_wake_me?: boolean } | null)
       : (data.user_b_permissions as { can_wake_me?: boolean } | null);
   return permissions?.can_wake_me === true;
+}
+
+function isWakeableTripStatus(status?: string | null) {
+  if (!status) {
+    return true;
+  }
+  return [
+    "active",
+    "in_progress",
+    "started",
+    "行程中",
+    "接近目的地",
+    "快到目的地",
+    "定位延遲",
+    "定位中斷"
+  ].includes(status);
 }

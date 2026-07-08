@@ -5,7 +5,13 @@ export type TripLifecycleLike = {
 };
 
 export function isTripEnded(trip: TripLifecycleLike | null | undefined) {
-  return Boolean(trip?.ended_at || trip?.status === "ended" || trip?.status === "arrived" || trip?.status === "已抵達");
+  return Boolean(
+    trip?.ended_at ||
+      trip?.status === "ended" ||
+      trip?.status === "arrived" ||
+      trip?.status === "stopped" ||
+      trip?.status === "已抵達"
+  );
 }
 
 export function isTripExpired(trip: TripLifecycleLike | null | undefined, now = Date.now()) {
@@ -29,7 +35,7 @@ export function canViewerInteractWithTrip(trip: TripLifecycleLike | null | undef
 }
 
 export function canWakeOwner(trip: TripLifecycleLike | null | undefined, now = Date.now()) {
-  return Boolean(trip && isTripActive(trip, now) && !shouldAutoExtendTrip(trip, now));
+  return Boolean(trip && isTripActive(trip, now));
 }
 
 export function getTripDisplayStatus(trip: TripLifecycleLike | null | undefined, now = Date.now()) {

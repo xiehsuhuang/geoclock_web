@@ -268,6 +268,7 @@ export default function Home() {
   const [familyConnectionMessage, setFamilyConnectionMessage] = useState("");
   const [preflightResults, setPreflightResults] = useState<PreflightCheckResult[]>([]);
   const [preflightSummary, setPreflightSummary] = useState("");
+  const [preflightTestedAt, setPreflightTestedAt] = useState<string | null>(null);
   const [viewerShareCode, setViewerShareCode] = useState("");
   const [viewerCodeInput, setViewerCodeInput] = useState("");
   const [viewerEntryMessage, setViewerEntryMessage] = useState("");
@@ -1007,15 +1008,36 @@ export default function Home() {
       appendEvent("嘗試開始沒有定位資料的行程", selectedDestination ? `${selectedDestination.name} 尚未取得定位資料` : "尚未選擇目的地");
       return;
     }
+    if (!("geolocation" in navigator)) {
+      setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
+      return;
+    }
+
     const safeArrivalRadius = getSafeArrivalRadius(arrivalRadiusMeters, radiusMeters);
-    stopGeolocationWatch();
-    resetPreflightChecks();
+    setStrongAlert("正在確認定位...");
+    try {
+      const position = await getCurrentPositionForStart();
+      const currentPosition: CurrentPosition = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy,
+        updatedAt: new Date().toISOString()
+      };
+      setLocationCheck(withTestedAt({ status: "成功", message: "定位可用", position: currentPosition }));
+      recordPreflightWarningsForStart();
+    } catch (error) {
+      const message = isGeolocationPositionError(error) ? getGeolocationFailureMessage(error) : "無法取得定位，請開啟定位權限後再出發。";
+      setLocationCheck(withTestedAt({ status: "失敗", message }));
+      setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
+      appendEvent("定位測試失敗", message);
+      return;
+    }
+
     setPreflightDestination(selectedDestination);
     setPreflightRadiusMeters(radiusMeters);
     setPreflightArrivalRadiusMeters(safeArrivalRadius);
-    setPreflightOpen(true);
-    setStrongAlert(null);
-    appendEvent("進入啟動前檢查", `準備前往 ${selectedDestination.name}`);
+    setPreflightOpen(false);
+    beginOfficialTrip(selectedDestination, radiusMeters, safeArrivalRadius);
   }
 
   function chooseAlertRadius(value: number) {
@@ -1243,6 +1265,38 @@ export default function Home() {
     setFamilyWakeCheck(withTestedAt({ status: "成功", message: "已觸發家人呼叫測試" }));
   }
 
+  function getCurrentPositionForStart() {
+    return new Promise<GeolocationPosition>((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        maximumAge: 5000,
+        timeout: 12000
+      });
+    });
+  }
+
+  function recordPreflightWarningsForStart() {
+    const checks = [
+      { label: "背景通知", state: notificationPermissionCheck },
+      { label: "可被呼叫", state: familyWakeCheck },
+      { label: "震動", state: vibrationCheck }
+    ];
+    for (const check of checks) {
+      if (check.state.status === "警告" || check.state.status === "失敗" || check.state.status === "不支援") {
+        appendNotificationCenterItem({
+          type: `行前檢查警告：${check.label}`,
+          success: false,
+          error: check.state.message,
+          shareCode: cloudShareRef.current.shareCode ?? null,
+          recipientCode: user?.code ?? null
+        });
+      }
+    }
+    if (checks.some((check) => check.state.status === "警告" || check.state.status === "失敗" || check.state.status === "不支援")) {
+      setStrongAlert("部分提醒功能尚未完整啟用，仍會開始行程。");
+    }
+  }
+
   function startOfficialTrip() {
     if (!preflightDestination || typeof preflightDestination.lat !== "number" || typeof preflightDestination.lng !== "number") {
       return;
@@ -1256,6 +1310,10 @@ export default function Home() {
       return;
     }
 
+    beginOfficialTrip(preflightDestination, preflightRadiusMeters, preflightArrivalRadiusMeters);
+  }
+
+  function beginOfficialTrip(destination: Destination, tripRadius: number, tripArrivalRadius: number) {
     stopGeolocationWatch();
     milestoneRef.current = new Set();
     eventGateRef.current = new Set();
@@ -1270,7 +1328,7 @@ export default function Home() {
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
     appendEvent(
       "正式開始旅程",
-      `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
+      `前往 ${destination.name}，快到提醒距離 ${formatDistance(tripRadius)}，已抵達判斷距離 ${formatDistance(tripArrivalRadius)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
     );
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
@@ -1280,10 +1338,10 @@ export default function Home() {
           setStrongAlert(null);
           appendEvent(
             "開始行程",
-            `前往 ${preflightDestination.name}，快到提醒距離 ${formatDistance(preflightRadiusMeters)}，已抵達判斷距離 ${formatDistance(preflightArrivalRadiusMeters)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
+            `前往 ${destination.name}，快到提醒距離 ${formatDistance(tripRadius)}，已抵達判斷距離 ${formatDistance(tripArrivalRadius)}，有效時間 ${formatTripDuration(tripDurationMinutes)}`
           );
         }
-        handlePositionUpdate(position, preflightDestination, preflightRadiusMeters, preflightArrivalRadiusMeters);
+        handlePositionUpdate(position, destination, tripRadius, tripArrivalRadius);
       },
       (error) => {
         const message = getGeolocationFailureMessage(error);
@@ -1856,6 +1914,7 @@ export default function Home() {
     const failed = results.filter((item) => item.status === "failed").length;
     const warnings = results.filter((item) => item.status === "warning").length;
     setPreflightResults(results);
+    setPreflightTestedAt(new Date().toISOString());
     setPreflightSummary(failed > 0 ? "有項目失敗，若 GPS 不可用請先修正。" : warnings > 0 ? "部分功能可能無法使用，仍可開始行程。" : "行前檢查完成。");
   }
 
@@ -2155,7 +2214,7 @@ export default function Home() {
     const { error } = await supabase
       .from("trips")
       .update({
-        status: status === "已抵達" ? "arrived" : "ended",
+        status: "ended",
         ended_at: new Date().toISOString()
       })
       .eq("id", share.tripId);
@@ -2729,6 +2788,7 @@ export default function Home() {
                   </button>
                 </div>
               </div>
+              {preflightTestedAt ? <p className="field-hint">最後測試：{formatTime(preflightTestedAt)}</p> : null}
               {preflightResults.length > 0 && preflightResults.some((item) => item.status !== "success") ? (
                 <p className="warning">部分提醒功能尚未啟用，仍可開始行程，但提醒可能不完整。</p>
               ) : null}
@@ -4522,6 +4582,10 @@ function isLikelySecureForGeolocation() {
 
   const { protocol, hostname } = window.location;
   return protocol === "https:" || hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function isGeolocationPositionError(error: unknown): error is GeolocationPositionError {
+  return Boolean(error && typeof error === "object" && "code" in error);
 }
 
 function getGeolocationFailureMessage(error: GeolocationPositionError) {

@@ -70,6 +70,13 @@ export function buildWakeRequestNotification() {
   };
 }
 
+export function buildWakeAcknowledgedNotification(displayName?: string | null) {
+  return {
+    title: displayName?.trim() ? `${displayName.trim()}已回應你的呼叫` : "對方已回應你的呼叫",
+    body: "對方已按下『我醒了』。"
+  };
+}
+
 function formatDistanceText(distanceMeters?: number | null) {
   return typeof distanceMeters === "number" ? `距離約 ${Math.max(0, Math.round(distanceMeters))} m。` : "";
 }
