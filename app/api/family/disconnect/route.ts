@@ -22,7 +22,7 @@ export async function POST(request: Request) {
   const { pairKey } = getFamilyPair(myCode, familyCode);
   const { error } = await supabase
     .from("family_connections")
-    .update({ status: "blocked", updated_at: new Date().toISOString() })
+    .update({ status: "disconnected", updated_at: new Date().toISOString() })
     .eq("pair_key", pairKey);
 
   if (error) {

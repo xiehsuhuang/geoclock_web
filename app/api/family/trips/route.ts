@@ -15,6 +15,8 @@ type FamilyConnectionRow = {
   user_b_code: string;
   user_a_permissions: FamilyPermissions | null;
   user_b_permissions: FamilyPermissions | null;
+  user_a_confirmed?: boolean;
+  user_b_confirmed?: boolean;
   status: string;
 };
 
@@ -46,9 +48,11 @@ export async function GET(request: Request) {
 
   const { data: connections, error: connectionError } = await supabase
     .from("family_connections")
-    .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions,status")
+    .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions,user_a_confirmed,user_b_confirmed,status")
     .or(`user_a_code.eq.${viewerCode},user_b_code.eq.${viewerCode}`)
-    .eq("status", "confirmed");
+    .eq("status", "confirmed")
+    .eq("user_a_confirmed", true)
+    .eq("user_b_confirmed", true);
 
   if (connectionError) {
     return NextResponse.json({ ok: false, error: connectionError.message, trips: [], families: [] }, { status: 500 });
@@ -93,15 +97,36 @@ export async function GET(request: Request) {
     }
   }
 
+  const { data: endedTrips, error: endedTripsError } = await supabase
+    .from("trips")
+    .select("*")
+    .in("owner_code", familyCodes)
+    .not("ended_at", "is", null)
+    .order("ended_at", { ascending: false })
+    .limit(Math.max(familyCodes.length * 3, 1));
+
+  if (endedTripsError) {
+    return NextResponse.json({ ok: false, error: endedTripsError.message, trips: [], families: [] }, { status: 500 });
+  }
+
+  const latestEndedTripByOwner = new Map<string, TripRow>();
+  for (const trip of (endedTrips ?? []) as TripRow[]) {
+    if (!latestEndedTripByOwner.has(trip.owner_code)) {
+      latestEndedTripByOwner.set(trip.owner_code, trip);
+    }
+  }
+
   const families = rows.map((connection) => {
     const familyCode = getOtherCode(connection, viewerCode);
     const permissions = getOwnerGrantedPermissions(connection, familyCode);
     const trip = latestTripByOwner.get(familyCode);
+    const latestEndedTrip = latestEndedTripByOwner.get(familyCode);
     return {
       owner_code: familyCode,
       connection_status: connection.status,
       permissions,
-      trip: trip ? decorateTrip(trip, permissions) : null
+      trip: trip ? decorateTrip(trip, permissions) : null,
+      latestEndedTrip: latestEndedTrip ? decorateTrip(latestEndedTrip, permissions) : null
     };
   });
 
@@ -165,6 +190,7 @@ async function getSingleFamilyTrip({
   }
 
   if (!data) {
+    const latestEndedTrip = await getLatestEndedTrip(ownerCode, permissions);
     return NextResponse.json({
       ok: true,
       message: "這位家人目前沒有進行中的行程。",
@@ -174,7 +200,8 @@ async function getSingleFamilyTrip({
           owner_code: ownerCode,
           connection_status: connection?.status ?? "not_connected",
           permissions,
-          trip: null
+          trip: null,
+          latestEndedTrip
         }
       ]
     });
@@ -194,6 +221,23 @@ async function getSingleFamilyTrip({
       }
     ]
   });
+}
+
+async function getLatestEndedTrip(ownerCode: string, permissions: FamilyPermissions) {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data } = await supabase
+    .from("trips")
+    .select("*")
+    .eq("owner_code", ownerCode)
+    .not("ended_at", "is", null)
+    .order("ended_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data ? decorateTrip(data as TripRow, permissions) : null;
 }
 
 function getOtherCode(connection: FamilyConnectionRow, viewerCode: string) {

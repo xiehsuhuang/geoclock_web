@@ -16,7 +16,7 @@ import { getNotificationDiagnostics, getStandaloneHint, isStandaloneMode, urlBas
 import { playAlertSoundFor, startAlertSoundLoop, stopAlertSoundLoop, unlockAlertSound } from "@/lib/sound";
 import { clearGeoClockStorage, DEFAULT_PRIVACY_SETTINGS, DEFAULT_TRIP_SETTINGS, loadSnapshot, STORAGE_KEYS, writeStored } from "@/lib/storage";
 import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
-import { canWakeOwner, getTripDisplayStatus, isTripActive } from "@/lib/tripStatus";
+import { canWakeOwner, getTripDisplayStatus, isTripActive, isTripEnded } from "@/lib/tripStatus";
 import type {
   ActiveTrip,
   CloudTripRow,
@@ -195,6 +195,14 @@ type FamilyTripRow = CloudTripRow & {
   permissions?: Partial<FamilyPermissions>;
 };
 
+type FamilyTripListItem = {
+  owner_code: string;
+  connection_status: string;
+  permissions?: Partial<FamilyPermissions>;
+  trip: FamilyTripRow | null;
+  latestEndedTrip?: FamilyTripRow | null;
+};
+
 type PreflightCheckResult = {
   key: string;
   label: string;
@@ -264,7 +272,7 @@ export default function Home() {
   const [connectionCode, setConnectionCode] = useState("");
   const [connectionPermissions, setConnectionPermissions] = useState<FamilyPermissions>(DEFAULT_FAMILY_CONNECTION_PERMISSIONS);
   const [familyConnections, setFamilyConnections] = useState<FamilyConnectionRow[]>([]);
-  const [familyTrips, setFamilyTrips] = useState<FamilyTripRow[]>([]);
+  const [familyTrips, setFamilyTrips] = useState<FamilyTripListItem[]>([]);
   const [familyConnectionMessage, setFamilyConnectionMessage] = useState("");
   const [preflightResults, setPreflightResults] = useState<PreflightCheckResult[]>([]);
   const [preflightSummary, setPreflightSummary] = useState("");
@@ -277,8 +285,7 @@ export default function Home() {
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [wakeLockStatus, setWakeLockStatus] = useState("尚未啟用");
   const [audioStatus, setAudioStatus] = useState("提醒音尚未啟用");
-  const [tripAlertSoundStatus, setTripAlertSoundStatus] = useState<"未解鎖" | "已解鎖" | "提醒中" | "已停止">("未解鎖");
-  const [ownerTripMuted, setOwnerTripMuted] = useState(false);
+  const [tripAlertSoundStatus, setTripAlertSoundStatus] = useState<"未解鎖" | "已解鎖" | "提醒中">("未解鎖");
   const [strongAlert, setStrongAlert] = useState<string | null>(null);
   const [cloudShare, setCloudShare] = useState<CloudShareState>({
     status: "idle",
@@ -555,7 +562,7 @@ export default function Home() {
     if (!activeTrip) {
       stopAlertSoundLoop();
       if (tripAlertSoundStatus === "提醒中") {
-        setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
+        setTripAlertSoundStatus("已解鎖");
       }
       return;
     }
@@ -571,10 +578,10 @@ export default function Home() {
   }, [activeTrip]);
 
   useEffect(() => {
-    if (!activeTrip || ownerTripMuted || !isTripAlertCondition(activeTrip)) {
+    if (!activeTrip || !isTripAlertCondition(activeTrip)) {
       stopAlertSoundLoop();
       if (tripAlertSoundStatus === "提醒中") {
-        setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
+        setTripAlertSoundStatus("已解鎖");
       }
       return;
     }
@@ -585,7 +592,7 @@ export default function Home() {
       intervalMs: 10000,
       onError: (error) => setAudioStatus(`提醒音播放失敗：${error}`)
     });
-  }, [activeTrip?.distanceMeters, activeTrip?.radiusMeters, activeTrip?.arrivalRadiusMeters, activeTrip?.status, ownerTripMuted]);
+  }, [activeTrip?.distanceMeters, activeTrip?.radiusMeters, activeTrip?.arrivalRadiusMeters, activeTrip?.status]);
 
   useEffect(() => {
     if (!activeTrip || !("geolocation" in navigator)) {
@@ -1014,24 +1021,24 @@ export default function Home() {
     }
 
     const safeArrivalRadius = getSafeArrivalRadius(arrivalRadiusMeters, radiusMeters);
-    setStrongAlert("正在確認定位...");
-    try {
-      const position = await getCurrentPositionForStart();
-      const currentPosition: CurrentPosition = {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-        accuracy: position.coords.accuracy,
-        updatedAt: new Date().toISOString()
-      };
-      setLocationCheck(withTestedAt({ status: "成功", message: "定位可用", position: currentPosition }));
-      recordPreflightWarningsForStart();
-    } catch (error) {
-      const message = isGeolocationPositionError(error) ? getGeolocationFailureMessage(error) : "無法取得定位，請開啟定位權限後再出發。";
-      setLocationCheck(withTestedAt({ status: "失敗", message }));
-      setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
-      appendEvent("定位測試失敗", message);
-      return;
+    setStrongAlert("正在準備行程...");
+    const recentPreflight = Boolean(preflightTestedAt && Date.now() - new Date(preflightTestedAt).getTime() <= 5 * 60 * 1000);
+    let startPreflightResults: PreflightCheckResult[] | null = null;
+    if (recentPreflight) {
+      const locationOk = await confirmLocationForStart();
+      if (!locationOk) {
+        return;
+      }
+    } else {
+      const results = await performPreflightChecks();
+      startPreflightResults = results;
+      const locationResult = results.find((item) => item.key === "location");
+      if (locationResult?.status !== "success") {
+        setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
+        return;
+      }
     }
+    recordPreflightWarningsForStart(startPreflightResults ?? undefined);
 
     setPreflightDestination(selectedDestination);
     setPreflightRadiusMeters(radiusMeters);
@@ -1275,24 +1282,47 @@ export default function Home() {
     });
   }
 
-  function recordPreflightWarningsForStart() {
-    const checks = [
-      { label: "背景通知", state: notificationPermissionCheck },
-      { label: "可被呼叫", state: familyWakeCheck },
-      { label: "震動", state: vibrationCheck }
-    ];
-    for (const check of checks) {
-      if (check.state.status === "警告" || check.state.status === "失敗" || check.state.status === "不支援") {
+  async function confirmLocationForStart() {
+    try {
+      const position = await getCurrentPositionForStart();
+      const currentPosition: CurrentPosition = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy,
+        updatedAt: new Date().toISOString()
+      };
+      setLocationCheck(withTestedAt({ status: "成功", message: "定位可用", position: currentPosition }));
+      return true;
+    } catch (error) {
+      const message = isGeolocationPositionError(error) ? getGeolocationFailureMessage(error) : "無法取得定位，請開啟定位權限後再出發。";
+      setLocationCheck(withTestedAt({ status: "失敗", message }));
+      setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
+      appendEvent("定位測試失敗", message);
+      return false;
+    }
+  }
+
+  function recordPreflightWarningsForStart(results?: PreflightCheckResult[]) {
+    const warningResults =
+      results?.filter((item) => item.status === "warning" || item.status === "failed") ??
+      [
+        { label: "背景通知", status: notificationPermissionCheck.status, message: notificationPermissionCheck.message },
+        { label: "可被呼叫", status: familyWakeCheck.status, message: familyWakeCheck.message },
+        { label: "震動", status: vibrationCheck.status, message: vibrationCheck.message },
+        { label: "防鎖屏", status: wakeLockCheck.status, message: wakeLockCheck.message },
+        { label: "雲端連線", status: cloudConnectionCheck.status, message: cloudConnectionCheck.message }
+      ].filter((check) => check.status === "警告" || check.status === "失敗" || check.status === "不支援");
+
+    for (const check of warningResults) {
         appendNotificationCenterItem({
           type: `行前檢查警告：${check.label}`,
           success: false,
-          error: check.state.message,
+          error: check.message,
           shareCode: cloudShareRef.current.shareCode ?? null,
           recipientCode: user?.code ?? null
         });
-      }
     }
-    if (checks.some((check) => check.state.status === "警告" || check.state.status === "失敗" || check.state.status === "不支援")) {
+    if (warningResults.length > 0) {
       setStrongAlert("部分提醒功能尚未完整啟用，仍會開始行程。");
     }
   }
@@ -1324,7 +1354,6 @@ export default function Home() {
     maybeArrivedCandidateStartedAtRef.current = null;
     maybeArrivedNotifiedRef.current = false;
     autoExtendedUntilRef.current = null;
-    setOwnerTripMuted(false);
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
     appendEvent(
       "正式開始旅程",
@@ -1516,8 +1545,8 @@ export default function Home() {
       stopGeolocationWatch();
       releaseWakeLock();
       stopAlertSoundLoop();
-      setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
-      appendEvent("停止行程", `${activeTrip.destination.name} 的行程已停止`);
+      setTripAlertSoundStatus("已解鎖");
+      appendEvent("結束行程", `${activeTrip.destination.name} 的行程已結束`);
     }
     setActiveTrip(null);
     setStrongAlert(null);
@@ -1532,7 +1561,7 @@ export default function Home() {
     maybeArrivedNotifiedRef.current = false;
     autoExtendedUntilRef.current = null;
     setCloudShare((current) =>
-      current.status === "active" ? { ...current, status: "idle", message: "共享行程已停止" } : current
+      current.status === "active" ? { ...current, status: "idle", message: "共享行程已結束" } : current
     );
   }
 
@@ -1624,7 +1653,8 @@ export default function Home() {
         throw error ?? new Error("Missing trip row");
       }
 
-      const recipientCodes = selectedTripRecipients.filter((code) => code !== user.code);
+      const validRecipientCodes = new Set(confirmedFamilyOptions.map((option) => option.code));
+      const recipientCodes = selectedTripRecipients.filter((code) => code !== user.code && validRecipientCodes.has(code));
       if (recipientCodes.length > 0) {
         const recipientRows = recipientCodes.map((code) => ({
           trip_id: data.id,
@@ -1635,7 +1665,17 @@ export default function Home() {
           can_view: true,
           can_receive_notifications: true
         }));
-        await supabase.from("trip_recipients").insert(recipientRows);
+        const { error: recipientsError } = await supabase.from("trip_recipients").insert(recipientRows);
+        if (recipientsError) {
+          appendNotificationCenterItem({
+            type: "本趟家人寫入失敗",
+            success: false,
+            error: recipientsError.message,
+            shareCode: data.share_code,
+            recipientCode: recipientCodes.join(",")
+          });
+          throw recipientsError;
+        }
       }
 
       setCloudShare({
@@ -1647,7 +1687,7 @@ export default function Home() {
         expiresAt
       });
       appendEvent("開啟家人共享", `分享連結已建立：${shareUrl}`);
-      void notifyFamilyTripEvent(data.share_code, "trip_started");
+      await notifyFamilyTripEvent(data.share_code, "trip_started");
     } catch {
       setCloudShare({
         status: "error",
@@ -1758,8 +1798,17 @@ export default function Home() {
   async function loadFamilyTrips(code: string) {
     try {
       const response = await fetch(`/api/family/trips?viewer_code=${encodeURIComponent(code)}`);
-      const payload = (await response.json()) as { trips?: FamilyTripRow[] };
-      setFamilyTrips(payload.trips ?? []);
+      const payload = (await response.json()) as { families?: FamilyTripListItem[]; trips?: FamilyTripRow[] };
+      if (payload.families) {
+        setFamilyTrips(payload.families);
+        return;
+      }
+      setFamilyTrips((payload.trips ?? []).map((trip) => ({
+        owner_code: trip.owner_code,
+        connection_status: "share_code",
+        trip,
+        latestEndedTrip: isTripEnded(trip) ? trip : null
+      })));
     } catch {
       setFamilyTrips([]);
     }
@@ -1802,7 +1851,7 @@ export default function Home() {
     if (!window.confirm("確定刪除這位家人嗎？")) {
       return;
     }
-    await fetch("/api/family/disconnect", {
+    const response = await fetch("/api/family/disconnect", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -1812,13 +1861,35 @@ export default function Home() {
         family_code: code
       })
     });
+    const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!response.ok || payload.ok === false) {
+      setFamilyConnectionMessage(payload.error ?? "移除家人失敗，請稍後再試。");
+      return;
+    }
     setSelectedTripRecipients((current) => current.filter((item) => item !== code));
+    setFamilyConnections((current) =>
+      current.filter((connection) => {
+        const otherCode = connection.user_a_code === user.code ? connection.user_b_code : connection.user_a_code;
+        return otherCode !== code;
+      })
+    );
+    setFamilyTrips((current) => current.filter((item) => item.owner_code !== code));
+    setFamily((current) => {
+      const next = current.filter((member) => member.code !== code);
+      return next;
+    });
+    setFamilyConnectionMessage("已解除家人連線。");
     void loadFamilyConnections(user.code);
+    void loadFamilyTrips(user.code);
   }
 
   async function runPreflightAll() {
+    await performPreflightChecks();
+  }
+
+  async function performPreflightChecks() {
     if (!user) {
-      return;
+      return [];
     }
     setLocationCheck({ status: "測試中", message: "正在測試定位..." });
     setAudioCheck({ status: "測試中", message: "正在測試提示音..." });
@@ -1916,6 +1987,7 @@ export default function Home() {
     setPreflightResults(results);
     setPreflightTestedAt(new Date().toISOString());
     setPreflightSummary(failed > 0 ? "有項目失敗，若 GPS 不可用請先修正。" : warnings > 0 ? "部分功能可能無法使用，仍可開始行程。" : "行前檢查完成。");
+    return results;
   }
 
   async function syncCloudTrip({
@@ -1973,7 +2045,7 @@ export default function Home() {
       message: "雲端行程已同步"
     }));
     const now = Date.now();
-    if (!ownerTripMuted && now - lastNotifyAttemptRef.current > 60_000) {
+    if (now - lastNotifyAttemptRef.current > 60_000) {
       lastNotifyAttemptRef.current = now;
       void notifyTripEvents(share.tripId, share.shareCode);
     }
@@ -2039,36 +2111,6 @@ export default function Home() {
       });
     } catch {
       // 自動通知失敗不應影響本機行程或雲端同步。
-    }
-  }
-
-  async function stopOwnerTripNotifications() {
-    setOwnerTripMuted(true);
-    setTripAlertSoundStatus("已停止");
-    stopAlertSoundLoop();
-    const share = cloudShareRef.current;
-    if (!user || share.status !== "active" || !share.shareCode) {
-      setAudioStatus("本趟通知已停止。若尚未開啟家人共享，停止狀態只保留在本頁。");
-      return;
-    }
-
-    try {
-      const response = await fetch("/api/notify/mute-trip", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          share_code: share.shareCode,
-          role: "owner",
-          user_code: user.code,
-          event_type: "all"
-        })
-      });
-      const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      setAudioStatus(payload.ok ? "本趟通知已停止。" : `本趟通知停止失敗：${payload.error ?? "未知錯誤"}`);
-    } catch (error) {
-      setAudioStatus(`本趟通知停止失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
     }
   }
 
@@ -2187,24 +2229,6 @@ export default function Home() {
     setTestModeMessage("已觸發本機家人呼叫測試。");
   }
 
-  async function clearTripMuteForTest() {
-    const share = cloudShareRef.current;
-    if (!supabase || share.status !== "active" || !share.shareCode || !user) {
-      setOwnerTripMuted(false);
-      setTripAlertSoundStatus("已解鎖");
-      setTestModeMessage("已清除本機停止狀態。");
-      return;
-    }
-    const { error } = await supabase
-      .from("trip_notification_mutes")
-      .update({ muted: false })
-      .eq("share_code", share.shareCode)
-      .eq("user_code", user.code);
-    setOwnerTripMuted(false);
-    setTripAlertSoundStatus("已解鎖");
-    setTestModeMessage(error ? `清除停止狀態失敗：${error.message}` : "已清除本趟通知停止狀態。");
-  }
-
   async function endCloudTrip(status: string) {
     const share = cloudShareRef.current;
     if (!supabase || share.status !== "active" || !share.tripId) {
@@ -2220,21 +2244,20 @@ export default function Home() {
       .eq("id", share.tripId);
 
     if (error) {
-      appendStatusEventOnce("雲端行程同步失敗", "停止行程同步到 Supabase 失敗");
+      appendStatusEventOnce("雲端行程同步失敗", "結束行程同步到 Supabase 失敗");
       return false;
     }
 
-    appendEvent("停止家人共享", "雲端共享行程已標記結束");
+    appendEvent("雲端行程同步成功", "雲端共享行程已標記結束");
     if (share.shareCode) {
-      void notifyFamilyTripEvent(share.shareCode, "trip_ended");
-      void stopOwnerTripNotifications();
+      await notifyFamilyTripEvent(share.shareCode, "trip_ended");
     }
     return true;
   }
 
   async function notifyFamilyTripEvent(shareCode: string, type: "trip_started" | "trip_ended") {
     try {
-      await fetch("/api/notify/family-trip", {
+      const response = await fetch("/api/notify/family-trip", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -2244,8 +2267,36 @@ export default function Home() {
           type
         })
       });
+      const payload = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        failed?: number;
+        errors?: string[];
+        sent?: number;
+      };
+      if (!response.ok || payload.ok === false || (payload.failed ?? 0) > 0) {
+        appendNotificationCenterItem({
+          type: type === "trip_started" ? "行程開始通知警告" : "行程結束通知警告",
+          success: false,
+          error: payload.errors?.join("、") || "部分家人通知未送出。",
+          shareCode,
+          recipientCode: null
+        });
+        return;
+      }
+      appendNotificationCenterItem({
+        type: type === "trip_started" ? "行程開始通知" : "行程結束通知",
+        success: true,
+        shareCode,
+        recipientCode: null
+      });
     } catch {
-      // 家人通知失敗不影響本機行程。
+      appendNotificationCenterItem({
+        type: type === "trip_started" ? "行程開始通知警告" : "行程結束通知警告",
+        success: false,
+        error: "通知 API 呼叫失敗。",
+        shareCode,
+        recipientCode: null
+      });
     }
   }
 
@@ -2810,7 +2861,7 @@ export default function Home() {
               ) : null}
               <div className="trip-actions">
                 <button className="primary-button" disabled={!selectedDestination || Boolean(activeTrip)} onClick={startTrip} type="button">
-                  開始行程
+                  出發
                 </button>
                 <button className="secondary-button" onClick={() => { setSidebarSection("notifications"); setSidebarOpen(true); }} type="button">
                   通知設定
@@ -2842,9 +2893,6 @@ export default function Home() {
               ) : null}
               <p className="notice">若一段時間沒有更新，家人會看到位置更新暫停。若需要穩定背景定位，之後需做原生 App。</p>
               <div className="trip-actions">
-                <button className="secondary-button" disabled={ownerTripMuted} onClick={stopOwnerTripNotifications} type="button">
-                  停止本趟通知
-                </button>
                 <button className="danger-button" onClick={stopTrip} type="button">
                   結束行程
                 </button>
@@ -2921,7 +2969,6 @@ export default function Home() {
         notificationState={notificationState}
         cloudConnectionCheck={cloudConnectionCheck}
         onClearLocalNotificationCenter={clearLocalNotificationCenter}
-        onClearTripMuteForTest={clearTripMuteForTest}
         onClose={() => setSidebarOpen(false)}
         onConnectFamily={connectFamily}
         onCopyShareCode={copyShareCode}
@@ -2940,7 +2987,6 @@ export default function Home() {
         onSimulateExpired={simulateTestExpired}
         onSimulateStale={simulateTestStale}
         onStartOfficialTrip={startOfficialTrip}
-        onStopOwnerTripNotifications={stopOwnerTripNotifications}
         onTestFamilyNotification={testFamilyNotification}
         onTestFamilyWake={testFamilyWake}
         onTestOwnerNotification={testOwnerNotification}
@@ -2952,7 +2998,6 @@ export default function Home() {
         onTestNotificationPermission={testNotificationPermission}
         onTestVibration={testVibration}
         onTestWakeLock={testWakeLock}
-        ownerTripMuted={ownerTripMuted}
         preflightArrivalRadiusMeters={preflightArrivalRadiusMeters}
         preflightCanStart={preflightCanStart}
         preflightChecksAttempted={preflightChecksAttempted}
@@ -3051,7 +3096,7 @@ export default function Home() {
           <p className="notice">通知功能需將網站加入 iPhone 主畫面後使用。</p>
           <p className="muted">{getStandaloneHint()}</p>
           <p className="muted">{notificationState.message}</p>
-          <p className="muted">連續呼叫提醒最多 15 秒，可由本人關閉。</p>
+          <p className="muted">家人每按一次呼叫，會送出一次通知。</p>
           <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={enableNotifications} type="button">
             啟用通知
           </button>
@@ -3270,10 +3315,10 @@ export default function Home() {
             disabled={!selectedDestination || Boolean(activeTrip)}
             onClick={startTrip}
           >
-            開始行程
+            出發
           </button>
           <button className="secondary-button" disabled={!activeTrip} onClick={stopTrip}>
-            停止行程
+            結束行程
           </button>
         </div>
         {!selectedDestination ? <p className="muted">請先選擇目的地。</p> : null}
@@ -3287,16 +3332,12 @@ export default function Home() {
         <p className="eyebrow">本趟提醒</p>
         <div className="status-grid">
           <Metric label="提醒聲狀態" value={tripAlertSoundStatus} />
-          <Metric label="本趟通知" value={ownerTripMuted ? "已停止" : "啟用中"} />
         </div>
         <p className="notice">前景開著時會每 10 秒響一次，每次約 5 秒。</p>
         <p className="muted">背景或鎖屏時只能依賴系統通知聲，網頁不能保證持續響鈴。</p>
         <div className="trip-actions">
           <button className="secondary-button" onClick={testAlertAudio} type="button">
             測試提示音
-          </button>
-          <button className="primary-button" disabled={!activeTrip || ownerTripMuted} onClick={stopOwnerTripNotifications} type="button">
-            收到，停止本趟通知
           </button>
         </div>
       </section>
@@ -3618,7 +3659,6 @@ function SettingsSidebar({
   notificationPermissionCheck,
   notificationState,
   onClearLocalNotificationCenter,
-  onClearTripMuteForTest,
   onClose,
   onConnectFamily,
   onCopyShareCode,
@@ -3637,7 +3677,6 @@ function SettingsSidebar({
   onSimulateExpired,
   onSimulateStale,
   onStartOfficialTrip,
-  onStopOwnerTripNotifications,
   onTestFamilyNotification,
   onTestFamilyWake,
   onTestOwnerNotification,
@@ -3649,7 +3688,6 @@ function SettingsSidebar({
   onTestNotificationPermission,
   onTestVibration,
   onTestWakeLock,
-  ownerTripMuted,
   preflightCanStart,
   preflightChecksAttempted,
   preflightDestination,
@@ -3686,7 +3724,6 @@ function SettingsSidebar({
   notificationPermissionCheck: PreflightCheckState;
   notificationState: NotificationState;
   onClearLocalNotificationCenter: () => void;
-  onClearTripMuteForTest: () => void;
   onClose: () => void;
   onConnectFamily: (event: FormEvent<HTMLFormElement>) => void;
   onCopyShareCode: () => void;
@@ -3705,7 +3742,6 @@ function SettingsSidebar({
   onSimulateExpired: () => void;
   onSimulateStale: (minutes: number) => void;
   onStartOfficialTrip: () => void;
-  onStopOwnerTripNotifications: () => void;
   onTestFamilyNotification: () => void;
   onTestFamilyWake: () => void;
   onTestOwnerNotification: () => void;
@@ -3717,7 +3753,6 @@ function SettingsSidebar({
   onTestNotificationPermission: () => void;
   onTestVibration: () => void;
   onTestWakeLock: () => void;
-  ownerTripMuted: boolean;
   preflightArrivalRadiusMeters: number;
   preflightCanStart: boolean;
   preflightChecksAttempted: boolean;
@@ -3797,7 +3832,6 @@ function SettingsSidebar({
           <div className="status-grid">
             <Metric label="背景通知" value={notificationState.status} />
             <Metric label="前景提示聲" value={tripAlertSoundStatus} />
-            <Metric label="本趟通知" value={ownerTripMuted ? "已停止" : "啟用中"} />
             <Metric label="防鎖屏" value={wakeLockStatus} />
           </div>
           <p className="notice">背景通知會透過系統通知提醒。畫面開著時，可額外播放提示聲。</p>
@@ -3811,9 +3845,6 @@ function SettingsSidebar({
             </button>
             <button className="secondary-button" onClick={onTestAlertAudio} type="button">
               測試提示音
-            </button>
-            <button className="secondary-button" disabled={!activeTrip || ownerTripMuted} onClick={onStopOwnerTripNotifications} type="button">
-              停止本趟通知
             </button>
           </div>
           {activeTrip ? (
@@ -3938,7 +3969,6 @@ function SettingsSidebar({
             <p className="eyebrow">清理</p>
             <div className="test-button-grid">
               <button className="danger-button" disabled={!activeTrip} onClick={onSimulateEndTrip} type="button">模擬結束行程</button>
-              <button className="secondary-button" onClick={onClearTripMuteForTest} type="button">清除本趟通知停止狀態</button>
             </div>
           </div>
           {testModeMessage ? <p className="form-notice">{testModeMessage}</p> : null}
@@ -4102,17 +4132,20 @@ function FamilyTripsPanel({
   onOpenFamilySettings?: () => void;
   onRefresh: () => void;
   onViewOwner?: (ownerCode: string) => void;
-  trips: FamilyTripRow[];
+  trips: FamilyTripListItem[];
 }) {
   const connectedFamilies = currentUserCode
     ? connections
         .filter((connection) => connection.status === "confirmed")
         .map((connection) => {
           const ownerCode = connection.user_a_code === currentUserCode ? connection.user_b_code : connection.user_a_code;
+          const familyItem = trips.find((trip) => trip.owner_code === ownerCode);
           return {
             ownerCode,
             connection,
-            trip: trips.find((trip) => trip.owner_code === ownerCode)
+            trip: familyItem?.trip ?? null,
+            latestEndedTrip: familyItem?.latestEndedTrip ?? null,
+            permissions: familyItem?.permissions
           };
         })
     : [];
@@ -4142,10 +4175,17 @@ function FamilyTripsPanel({
         <div className="family-list">
           {(connectedFamilies.length > 0
             ? connectedFamilies
-            : trips.map((trip) => ({ ownerCode: trip.owner_code, connection: null, trip }))
+            : trips.map((item) => ({
+                ownerCode: item.owner_code,
+                connection: null,
+                trip: item.trip,
+                latestEndedTrip: item.latestEndedTrip ?? null,
+                permissions: item.permissions
+              }))
           ).map((item) => {
-            const permissions = item.trip?.permissions;
+            const permissions = item.permissions ?? item.trip?.permissions ?? item.latestEndedTrip?.permissions;
             const activeFamilyTrip = item.trip && isTripActive(item.trip) ? item.trip : null;
+            const latestEndedTrip = !activeFamilyTrip ? item.latestEndedTrip : null;
             const canWake = permissions?.can_wake_me !== false && canWakeOwner(activeFamilyTrip);
             return (
               <div className="family-row" key={item.ownerCode}>
@@ -4155,11 +4195,16 @@ function FamilyTripsPanel({
                   <p className="field-hint">
                     {activeFamilyTrip
                       ? `${getTripDisplayStatus(activeFamilyTrip)}，最近更新：${formatTime(activeFamilyTrip.last_location_at ?? undefined)}`
-                      : "這位家人目前沒有進行中的行程。"}
+                      : "目前沒有行程。"}
                   </p>
+                  {latestEndedTrip ? (
+                    <p className="field-hint">
+                      上次行程：{latestEndedTrip.destination_name || "目的地"}，結束時間：{formatTime(latestEndedTrip.ended_at ?? undefined)}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="family-row-actions">
-                  <button className="primary-button" onClick={() => (onViewOwner ? onViewOwner(item.ownerCode) : item.trip && (window.location.href = `/share/${item.trip.share_code}`))} type="button">
+                  <button className="primary-button" disabled={!activeFamilyTrip} onClick={() => activeFamilyTrip && (onViewOwner ? onViewOwner(item.ownerCode) : (window.location.href = `/share/${activeFamilyTrip.share_code}`))} type="button">
                     查看目前行程
                   </button>
                   {canWake && activeFamilyTrip ? (
@@ -4428,6 +4473,7 @@ function isNotificationCenterEvent(type: EventType) {
     "已抵達",
     "定位延遲",
     "定位中斷",
+    "結束行程",
     "停止行程",
     "模擬叫醒",
     "通知訂閱成功",

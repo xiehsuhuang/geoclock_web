@@ -178,8 +178,7 @@ function SharedTripView({
   });
   const [notificationDiagnostics, setNotificationDiagnostics] = useState<NotificationDiagnostic[]>([]);
   const [viewerCode, setViewerCode] = useState("");
-  const [viewerTripMuted, setViewerTripMuted] = useState(false);
-  const [viewerAlertSoundStatus, setViewerAlertSoundStatus] = useState<"尚未測試" | "已解鎖" | "提醒中" | "本趟已停止">("尚未測試");
+  const [viewerAlertSoundStatus, setViewerAlertSoundStatus] = useState<"尚未測試" | "已解鎖" | "提醒中">("尚未測試");
   const [viewerAlertMessage, setViewerAlertMessage] = useState("畫面開著時會響；背景只會收到系統通知。");
   const health = getSharedHealth(trip);
   const statusLabel = getShareStatusLabel(trip);
@@ -240,14 +239,10 @@ function SharedTripView({
   }, []);
 
   useEffect(() => {
-    void refreshViewerMuteStatus();
-  }, [trip.share_code, viewerCode]);
-
-  useEffect(() => {
     const shouldAlert = isViewerAlertCondition(trip, health);
-    if (!tripActive || !shouldAlert || viewerTripMuted) {
+    if (!tripActive || !shouldAlert) {
       stopAlertSoundLoop();
-      setViewerAlertSoundStatus(viewerTripMuted ? "本趟已停止" : "已解鎖");
+      setViewerAlertSoundStatus("已解鎖");
       return;
     }
 
@@ -257,32 +252,7 @@ function SharedTripView({
       intervalMs: 10000,
       onError: (error) => setViewerAlertMessage(`提醒聲播放失敗：${error}`)
     });
-  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, trip.ended_at, trip.expires_at, health, viewerTripMuted, tripActive]);
-
-  async function refreshViewerMuteStatus() {
-    const endpoint = await getCurrentPushEndpoint();
-    const query = new URLSearchParams({
-      share_code: trip.share_code,
-      role: "viewer",
-      event_type: "all"
-    });
-    if (endpoint) {
-      query.set("endpoint", endpoint);
-    } else if (viewerCode) {
-      query.set("user_code", viewerCode);
-    } else {
-      setViewerTripMuted(false);
-      return;
-    }
-
-    try {
-      const response = await fetch(`/api/notify/mute-status?${query.toString()}`);
-      const payload = (await response.json()) as { muted?: boolean };
-      setViewerTripMuted(Boolean(payload.muted));
-    } catch {
-      setViewerTripMuted(false);
-    }
-  }
+  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, trip.ended_at, trip.expires_at, health, tripActive]);
 
   async function testViewerAlertSound() {
     const unlocked = await unlockAlertSound();
@@ -297,33 +267,6 @@ function SharedTripView({
     }
     setViewerAlertSoundStatus("已解鎖");
     setViewerAlertMessage("提示音已解鎖。畫面開著時會響；背景只會收到系統通知。");
-  }
-
-  async function stopViewerTripNotifications() {
-    stopAlertSoundLoop();
-    setViewerTripMuted(true);
-    setViewerAlertSoundStatus("本趟已停止");
-    const endpoint = await getCurrentPushEndpoint();
-
-    try {
-      const response = await fetch("/api/notify/mute-trip", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          share_code: trip.share_code,
-          role: "viewer",
-          user_code: viewerCode || undefined,
-          endpoint: endpoint || undefined,
-          event_type: "all"
-        })
-      });
-      const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      setViewerAlertMessage(payload.ok ? "本趟通知已停止。" : `停止通知失敗：${payload.error ?? "未知錯誤"}`);
-    } catch (error) {
-      setViewerAlertMessage(`停止通知失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
-    }
   }
 
   async function enableViewerNotifications() {
@@ -515,7 +458,6 @@ function SharedTripView({
         <div className="status-grid">
           <Metric label="家人通知" value={notificationState.status} />
           <Metric label="提醒聲" value={viewerAlertSoundStatus} />
-          <Metric label="本趟通知" value={viewerTripMuted ? "已停止" : "啟用中"} />
         </div>
         <p className="notice">背景通知會透過系統通知提醒；畫面開著時，可額外播放提示聲。</p>
         <p className="muted">通知功能需將網站加入 iPhone 主畫面後使用。Web Push 不是原生鬧鐘，不能保證無視靜音。</p>
@@ -532,7 +474,7 @@ function SharedTripView({
                 : "這趟行程目前不可互動。"}
           </p>
         ) : null}
-        <p className={viewerTripMuted ? "good" : "muted"}>{viewerAlertMessage}</p>
+        <p className="muted">{viewerAlertMessage}</p>
         {tripActive ? (
         <div className="trip-actions">
           <button className="primary-button" onClick={enableViewerNotifications} type="button">
@@ -543,9 +485,6 @@ function SharedTripView({
           </button>
           <button className="secondary-button" disabled={wakeStatus === "sending" || !viewerCanWake} onClick={callOwner} type="button">
             呼叫對方
-          </button>
-          <button className="secondary-button" disabled={viewerTripMuted} onClick={stopViewerTripNotifications} type="button">
-            收到，停止本趟通知
           </button>
         </div>
         ) : null}

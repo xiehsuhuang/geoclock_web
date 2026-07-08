@@ -15,6 +15,9 @@ export async function GET(request: Request) {
     .from("family_connections")
     .select("*")
     .or(`user_a_code.eq.${code},user_b_code.eq.${code}`)
+    .eq("status", "confirmed")
+    .eq("user_a_confirmed", true)
+    .eq("user_b_confirmed", true)
     .order("updated_at", { ascending: false });
 
   if (error) {

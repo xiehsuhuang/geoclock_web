@@ -15,8 +15,15 @@ export function getDestinationLabel(trip: TripTextLike) {
 
 export function buildTripStartedNotification(trip: TripTextLike) {
   return {
-    title: "GeoClock 行程開始",
-    body: `${getDisplayName(trip.owner_code)} 已開始前往 ${getDestinationLabel(trip)}。你可以打開 GeoClock 查看狀態。`
+    title: `${getDisplayName(trip.owner_code)}即將前往 ${getDestinationLabel(trip)}`,
+    body: "點擊查看目前行程狀態"
+  };
+}
+
+export function buildTripEndedNotification(trip: TripTextLike) {
+  return {
+    title: `${getDisplayName(trip.owner_code)}已結束前往 ${getDestinationLabel(trip)} 的行程`,
+    body: "點擊查看行程狀態"
   };
 }
 

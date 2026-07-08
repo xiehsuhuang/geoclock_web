@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import webpush from "web-push";
-import { buildTripStartedNotification } from "@/lib/notificationText";
+import { buildTripEndedNotification, buildTripStartedNotification } from "@/lib/notificationText";
 import { supabase } from "@/lib/supabaseClient";
 import { isTripActive } from "@/lib/tripStatus";
 
@@ -9,13 +9,6 @@ export const runtime = "nodejs";
 type Payload = {
   share_code?: string;
   type?: "trip_started" | "trip_ended";
-};
-
-type FamilyConnectionRow = {
-  user_a_code: string;
-  user_b_code: string;
-  user_a_permissions: Record<string, boolean> | null;
-  user_b_permissions: Record<string, boolean> | null;
 };
 
 type SubscriptionRow = {
@@ -52,7 +45,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, sent: 0, failed: 0, skippedCooldown: 0, skippedReason: "trip_not_active" });
   }
 
-  const viewerCodes = await getNotificationViewerCodes(trip.owner_code, trip.share_code, type);
+  const viewerCodes = await getNotificationViewerCodes(trip.share_code);
   if (viewerCodes.length === 0) {
     return NextResponse.json({ ok: true, sent: 0, failed: 0, skippedCooldown: 0 });
   }
@@ -61,6 +54,8 @@ export async function POST(request: Request) {
     .from("push_subscriptions")
     .select("endpoint,p256dh,auth,user_code")
     .in("user_code", viewerCodes);
+  const subscriptionRows = (subscriptions ?? []) as SubscriptionRow[];
+  const subscribedCodes = new Set(subscriptionRows.map((subscription) => subscription.user_code).filter(Boolean));
 
   webpush.setVapidDetails(
     process.env.VAPID_SUBJECT,
@@ -72,10 +67,7 @@ export async function POST(request: Request) {
   let failed = 0;
   let skippedCooldown = 0;
   const errors: string[] = [];
-  const content =
-    type === "trip_started"
-      ? buildTripStartedNotification(trip)
-      : { title: "GeoClock 行程結束", body: `${trip.owner_code || "對方"} 已結束這趟行程。` };
+  const content = type === "trip_started" ? buildTripStartedNotification(trip) : buildTripEndedNotification(trip);
   const notificationPayload = JSON.stringify({
     ...content,
     type,
@@ -85,7 +77,21 @@ export async function POST(request: Request) {
     tag: `geoclock-${trip.id}-${type}`
   });
 
-  for (const subscription of (subscriptions ?? []) as SubscriptionRow[]) {
+  for (const viewerCode of viewerCodes) {
+    if (!subscribedCodes.has(viewerCode)) {
+      const hasLoggedMissingSubscription = await hasTripLifecycleEvent(trip.share_code, type, viewerCode, null);
+      if (hasLoggedMissingSubscription) {
+        skippedCooldown += 1;
+        continue;
+      }
+      failed += 1;
+      const message = "家人尚未啟用通知。";
+      errors.push(`${viewerCode}: ${message}`);
+      await insertEvent(trip.id, trip.share_code, type, viewerCode, null, false, message);
+    }
+  }
+
+  for (const subscription of subscriptionRows) {
     const recipientCode = subscription.user_code;
     const hasSent = await hasTripLifecycleEvent(trip.share_code, type, recipientCode, subscription.endpoint);
     if (hasSent) {
@@ -117,7 +123,7 @@ export async function POST(request: Request) {
   return NextResponse.json({ ok: true, sent, failed, skippedCooldown, errors });
 }
 
-async function hasTripLifecycleEvent(shareCode: string, type: "trip_started" | "trip_ended", recipientCode: string | null, endpoint: string) {
+async function hasTripLifecycleEvent(shareCode: string, type: "trip_started" | "trip_ended", recipientCode: string | null, endpoint: string | null) {
   if (!supabase) {
     return false;
   }
@@ -144,7 +150,7 @@ async function insertEvent(
   shareCode: string,
   type: "trip_started" | "trip_ended",
   recipientCode: string | null,
-  endpoint: string,
+  endpoint: string | null,
   success: boolean,
   error?: string
 ) {
@@ -164,7 +170,7 @@ async function insertEvent(
   });
 }
 
-async function getNotificationViewerCodes(ownerCode: string, shareCode: string, type: "trip_started" | "trip_ended") {
+async function getNotificationViewerCodes(shareCode: string) {
   if (!supabase) {
     return [];
   }
@@ -175,21 +181,5 @@ async function getNotificationViewerCodes(ownerCode: string, shareCode: string, 
     .eq("share_code", shareCode)
     .eq("can_receive_notifications", true);
   const recipientCodes = ((selectedRecipients ?? []) as { recipient_code: string }[]).map((row) => row.recipient_code);
-  if (type === "trip_started") {
-    return Array.from(new Set(recipientCodes));
-  }
-
-  const { data } = await supabase
-    .from("family_connections")
-    .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions")
-    .or(`user_a_code.eq.${ownerCode},user_b_code.eq.${ownerCode}`)
-    .eq("status", "confirmed");
-
-  const familyCodes = ((data ?? []) as FamilyConnectionRow[])
-    .filter((connection) => {
-      const ownerPermissions = connection.user_a_code === ownerCode ? connection.user_a_permissions : connection.user_b_permissions;
-      return ownerPermissions?.can_receive_notifications === true;
-    })
-    .map((connection) => (connection.user_a_code === ownerCode ? connection.user_b_code : connection.user_a_code));
-  return Array.from(new Set([...recipientCodes, ...familyCodes]));
+  return Array.from(new Set(recipientCodes));
 }
