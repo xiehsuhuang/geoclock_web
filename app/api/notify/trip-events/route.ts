@@ -1,12 +1,20 @@
 import { NextResponse } from "next/server";
 import webpush from "web-push";
+import {
+  buildArrivedNotification,
+  buildAutoExtendedNotification,
+  buildMaybeArrivedNotification,
+  buildNearDestinationNotification
+} from "@/lib/notificationText";
 import { supabase } from "@/lib/supabaseClient";
+import { isTripEnded, shouldAutoExtendTrip } from "@/lib/tripStatus";
 
 export const runtime = "nodejs";
 
 type NotifyTripEventsPayload = {
   tripId?: string;
   shareCode?: string;
+  eventType?: NotificationEventType;
 };
 
 type TripEventRow = {
@@ -14,6 +22,7 @@ type TripEventRow = {
   share_code: string;
   owner_code: string;
   destination_name: string | null;
+  destination_address: string | null;
   alert_radius_m: number | null;
   arrival_radius_m: number | null;
   status: string | null;
@@ -40,7 +49,7 @@ type FamilyConnectionRow = {
   user_b_permissions: Record<string, boolean> | null;
 };
 
-type NotificationEventType = "near_destination" | "arrived" | "location_lost";
+type NotificationEventType = "near_destination" | "arrived" | "location_lost" | "maybe_arrived" | "auto_extended";
 
 type Recipient = {
   role: "owner" | "viewer";
@@ -54,7 +63,9 @@ const MAX_ACTIVE_TRIP_AGE_MS = 24 * 60 * 60 * 1000;
 const COOLDOWN_MS: Record<NotificationEventType, number | null> = {
   near_destination: 5 * 60 * 1000,
   arrived: null,
-  location_lost: 10 * 60 * 1000
+  location_lost: 10 * 60 * 1000,
+  maybe_arrived: 30 * 60 * 1000,
+  auto_extended: 30 * 60 * 1000
 };
 
 export async function POST(request: Request) {
@@ -84,7 +95,7 @@ export async function POST(request: Request) {
   const query = supabase
     .from("trips")
     .select(
-      "id, share_code, owner_code, destination_name, alert_radius_m, arrival_radius_m, status, distance_m, last_location_at, started_at, ended_at, expires_at"
+      "id, share_code, owner_code, destination_name, destination_address, alert_radius_m, arrival_radius_m, status, distance_m, last_location_at, started_at, ended_at, expires_at"
     );
   const { data: tripData, error: tripError } = tripId
     ? await query.eq("id", tripId).maybeSingle()
@@ -98,14 +109,15 @@ export async function POST(request: Request) {
   }
 
   const trip = tripData as TripEventRow;
-  if (trip.ended_at || trip.status === "ended") {
+  if (isTripEnded(trip)) {
     return NextResponse.json({ ...result, skippedReason: "trip_ended", skippedEndedCount: 1 });
   }
-  if (trip.expires_at && Date.now() >= new Date(trip.expires_at).getTime()) {
-    return NextResponse.json({ ...result, skippedReason: "trip_expired", skippedEndedCount: 1 });
+  if (shouldAutoExtendTrip(trip)) {
+    return NextResponse.json({ ...result, skippedReason: "trip_needs_auto_extend", skippedEndedCount: 1 });
   }
 
-  const targetEvents = getTargetEvents(trip);
+  const forcedEvent = isNotificationEventType(payload.eventType) ? payload.eventType : null;
+  const targetEvents = forcedEvent ? [forcedEvent] : getTargetEvents(trip);
   result.checkedEvents = targetEvents;
   if (targetEvents.length === 0) {
     return NextResponse.json(result);
@@ -121,10 +133,9 @@ export async function POST(request: Request) {
     process.env.VAPID_PRIVATE_KEY
   );
 
-  const recipients = await getRecipients(trip);
   result.debug = {
     shareCode: trip.share_code,
-    recipientCount: recipients.length,
+    targetEventCount: targetEvents.length,
     distanceMeters: trip.distance_m,
     alertRadiusMeters: trip.alert_radius_m ?? 500,
     arrivalRadiusMeters: trip.arrival_radius_m ?? 100,
@@ -132,6 +143,13 @@ export async function POST(request: Request) {
   };
 
   for (const eventType of targetEvents) {
+    const recipients = await getRecipients(trip, eventType);
+    if (recipients.length === 0 && (eventType === "maybe_arrived" || eventType === "auto_extended")) {
+      await insertSyntheticOwnerNotificationRecord(trip, eventType, "owner_subscription_missing");
+      result.failedCount += 1;
+      result.errors.push("owner_subscription_missing");
+      continue;
+    }
     for (const recipient of recipients) {
       const muted = await isMuted(trip.share_code, recipient);
       if (muted) {
@@ -183,7 +201,7 @@ function getTargetEvents(trip: TripEventRow): NotificationEventType[] {
   if (!startedAt || Number.isNaN(startedAt) || now - startedAt > MAX_ACTIVE_TRIP_AGE_MS) {
     return [];
   }
-  if (trip.expires_at && now >= new Date(trip.expires_at).getTime()) {
+  if (shouldAutoExtendTrip(trip, now)) {
     return [];
   }
 
@@ -192,9 +210,6 @@ function getTargetEvents(trip: TripEventRow): NotificationEventType[] {
   const arrivalRadiusMeters = trip.arrival_radius_m ?? 100;
   if (typeof trip.distance_m === "number" && trip.distance_m <= alertRadiusMeters) {
     events.push("near_destination");
-  }
-  if (typeof trip.distance_m === "number" && trip.distance_m <= arrivalRadiusMeters) {
-    events.push("arrived");
   }
   if (trip.last_location_at) {
     const lastLocationAt = new Date(trip.last_location_at).getTime();
@@ -206,7 +221,7 @@ function getTargetEvents(trip: TripEventRow): NotificationEventType[] {
   return events;
 }
 
-async function getRecipients(trip: TripEventRow): Promise<Recipient[]> {
+async function getRecipients(trip: TripEventRow, eventType: NotificationEventType): Promise<Recipient[]> {
   if (!supabase) {
     return [];
   }
@@ -230,7 +245,11 @@ async function getRecipients(trip: TripEventRow): Promise<Recipient[]> {
 
   const familyRecipients = await getFamilyRecipients(trip.owner_code);
   const selectedRecipients = await getTripSelectedRecipients(trip.share_code);
-  return dedupeRecipients([...baseRecipients, ...familyRecipients, ...selectedRecipients]);
+  const allRecipients = dedupeRecipients([...baseRecipients, ...familyRecipients, ...selectedRecipients]);
+  if (eventType === "maybe_arrived" || eventType === "auto_extended") {
+    return allRecipients.filter((recipient) => recipient.role === "owner");
+  }
+  return allRecipients;
 }
 
 async function getTripSelectedRecipients(shareCode: string): Promise<Recipient[]> {
@@ -395,27 +414,38 @@ async function insertNotificationRecord(
   });
 }
 
+async function insertSyntheticOwnerNotificationRecord(trip: TripEventRow, eventType: NotificationEventType, error: string) {
+  if (!supabase) {
+    return;
+  }
+
+  await supabase.from("notification_events").insert({
+    trip_id: trip.id,
+    share_code: trip.share_code,
+    event_type: eventType,
+    recipient_role: "owner",
+    recipient_code: trip.owner_code,
+    endpoint: null,
+    success: false,
+    error
+  });
+}
+
 function getNotificationContent(role: "owner" | "viewer", eventType: NotificationEventType, trip: TripEventRow) {
   const ownerName = trip.owner_code || "對方";
   const distanceText = typeof trip.distance_m === "number" ? `距離約 ${Math.max(0, Math.round(trip.distance_m))} m。` : "";
 
-  if (role === "owner" && eventType === "near_destination") {
-    return {
-      title: "GeoClock 到站提醒",
-      body: `快到目的地了，${distanceText}請確認是否醒著。`
-    };
-  }
-  if (role === "owner" && eventType === "arrived") {
-    return {
-      title: "GeoClock 已抵達",
-      body: "你已抵達目的地，請確認是否醒著。"
-    };
+  if (eventType === "near_destination") {
+    return buildNearDestinationNotification(trip, role);
   }
   if (eventType === "arrived") {
-    return {
-      title: "GeoClock 已抵達",
-      body: `${ownerName} 已抵達目的地。`
-    };
+    return buildArrivedNotification(trip, role);
+  }
+  if (eventType === "maybe_arrived") {
+    return buildMaybeArrivedNotification(trip);
+  }
+  if (eventType === "auto_extended") {
+    return buildAutoExtendedNotification(trip);
   }
   if (eventType === "location_lost") {
     return {
@@ -427,4 +457,14 @@ function getNotificationContent(role: "owner" | "viewer", eventType: Notificatio
     title: "GeoClock 到站提醒",
     body: `${ownerName} 快到目的地了，${distanceText}`
   };
+}
+
+function isNotificationEventType(eventType: unknown): eventType is NotificationEventType {
+  return (
+    eventType === "near_destination" ||
+    eventType === "arrived" ||
+    eventType === "location_lost" ||
+    eventType === "maybe_arrived" ||
+    eventType === "auto_extended"
+  );
 }

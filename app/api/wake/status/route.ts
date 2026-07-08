@@ -19,3 +19,22 @@ export async function GET(request: Request) {
 
   return NextResponse.json(data);
 }
+
+export async function POST(request: Request) {
+  if (!supabase) {
+    return NextResponse.json({ message: "尚未設定 Supabase。" }, { status: 503 });
+  }
+
+  const payload = (await request.json().catch(() => ({}))) as { id?: string };
+  const id = payload.id?.trim();
+  if (!id) {
+    return NextResponse.json({ message: "缺少呼叫 ID。" }, { status: 400 });
+  }
+
+  const { data, error } = await supabase.from("wake_requests").select("id, status, acknowledged_at, stopped_at").eq("id", id).maybeSingle();
+  if (error || !data) {
+    return NextResponse.json({ message: "找不到呼叫紀錄。" }, { status: 404 });
+  }
+
+  return NextResponse.json(data);
+}

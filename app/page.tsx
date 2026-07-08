@@ -16,6 +16,7 @@ import { getNotificationDiagnostics, getStandaloneHint, isStandaloneMode, urlBas
 import { playAlertSoundFor, startAlertSoundLoop, stopAlertSoundLoop, unlockAlertSound } from "@/lib/sound";
 import { clearGeoClockStorage, DEFAULT_PRIVACY_SETTINGS, DEFAULT_TRIP_SETTINGS, loadSnapshot, STORAGE_KEYS, writeStored } from "@/lib/storage";
 import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
+import { canWakeOwner, getTripDisplayStatus, isTripActive } from "@/lib/tripStatus";
 import type {
   ActiveTrip,
   CloudTripRow,
@@ -56,6 +57,10 @@ const DEFAULT_ARRIVAL_RADIUS_METERS = 100;
 const DEFAULT_TRIP_DURATION_MINUTES = 120;
 const MIN_ALERT_RADIUS_METERS = 50;
 const MAX_ALERT_RADIUS_METERS = 10000;
+const CONFIRMED_ARRIVAL_DISTANCE_METERS = 20;
+const CONFIRMED_ARRIVAL_DURATION_MS = 5 * 60 * 1000;
+const MAYBE_ARRIVED_DELAY_MS = 10 * 60 * 1000;
+const AUTO_EXTEND_MINUTES = 30;
 const VIEWER_CODE_STORAGE_KEY = "geoclock.web.viewerCode";
 const NOTIFICATION_CENTER_STORAGE_KEY = "geoclock.web.notificationCenter";
 const MILESTONE_METERS = [5000, 2000, 1000, 500, 300];
@@ -83,11 +88,12 @@ const FAMILY_PERMISSION_OPTIONS: { key: keyof FamilyPermissions; label: string }
   { key: "can_view_destination", label: "看得到目的地名稱" }
 ];
 
-type PreflightStatus = "尚未測試" | "測試中" | "成功" | "失敗" | "不支援";
+type PreflightStatus = "尚未測試" | "測試中" | "成功" | "警告" | "失敗" | "不支援";
 
 type PreflightCheckState = {
   status: PreflightStatus;
   message: string;
+  lastTestedAt?: string;
 };
 
 type LocationCheckState = PreflightCheckState & {
@@ -109,6 +115,22 @@ const initialVibrationCheck: PreflightCheckState = {
 const initialWakeLockCheck: PreflightCheckState = {
   status: "尚未測試",
   message: "尚未嘗試防鎖屏"
+};
+const initialNotificationPermissionCheck: PreflightCheckState = {
+  status: "尚未測試",
+  message: "尚未測試背景通知"
+};
+const initialCloudConnectionCheck: PreflightCheckState = {
+  status: "尚未測試",
+  message: "尚未測試雲端連線"
+};
+const initialFamilyNotificationCheck: PreflightCheckState = {
+  status: "尚未測試",
+  message: "尚未測試家人通知"
+};
+const initialFamilyWakeCheck: PreflightCheckState = {
+  status: "尚未測試",
+  message: "尚未測試家人呼叫"
 };
 
 type WakeLockSentinelLike = {
@@ -280,6 +302,10 @@ export default function Home() {
   const [audioCheck, setAudioCheck] = useState<PreflightCheckState>(initialAudioCheck);
   const [vibrationCheck, setVibrationCheck] = useState<PreflightCheckState>(initialVibrationCheck);
   const [wakeLockCheck, setWakeLockCheck] = useState<PreflightCheckState>(initialWakeLockCheck);
+  const [notificationPermissionCheck, setNotificationPermissionCheck] = useState<PreflightCheckState>(initialNotificationPermissionCheck);
+  const [cloudConnectionCheck, setCloudConnectionCheck] = useState<PreflightCheckState>(initialCloudConnectionCheck);
+  const [familyNotificationCheck, setFamilyNotificationCheck] = useState<PreflightCheckState>(initialFamilyNotificationCheck);
+  const [familyWakeCheck, setFamilyWakeCheck] = useState<PreflightCheckState>(initialFamilyWakeCheck);
   const [foregroundLocationMessage, setForegroundLocationMessage] = useState("");
 
   const watchIdRef = useRef<number | null>(null);
@@ -294,8 +320,14 @@ export default function Home() {
   });
   const autoCloudShareStartedRef = useRef(false);
   const lastNotifyAttemptRef = useRef(0);
+  const arrivalCandidateStartedAtRef = useRef<number | null>(null);
+  const confirmedArrivalCompletedRef = useRef(false);
+  const maybeArrivedCandidateStartedAtRef = useRef<number | null>(null);
+  const maybeArrivedNotifiedRef = useRef(false);
+  const autoExtendedUntilRef = useRef<string | null>(null);
   const wakeToneIntervalRef = useRef<number | null>(null);
   const wakeToneTimeoutRef = useRef<number | null>(null);
+  const lastHandledWakeRequestIdRef = useRef<string | null>(null);
 
   const selectedDestination = useMemo(
     () => destinations.find((destination) => destination.id === selectedDestinationId) ?? null,
@@ -314,6 +346,7 @@ export default function Home() {
   );
   const mapDestination = activeTrip?.destination ?? selectedDestination;
   const mapPosition = activeTrip?.lastPosition;
+  const hasActiveLocalTrip = Boolean(activeTrip);
   const mapRadiusMeters = activeTrip?.radiusMeters ?? radiusMeters;
   const displayArrivalRadiusMeters = activeTrip?.arrivalRadiusMeters ?? arrivalRadiusMeters;
   const approximateLocationPreview = mapPosition ? getApproximateLocation(mapPosition.lat, mapPosition.lng) : null;
@@ -322,7 +355,7 @@ export default function Home() {
     audioCheck.status !== "尚未測試" &&
     vibrationCheck.status !== "尚未測試" &&
     wakeLockCheck.status !== "尚未測試";
-  const preflightCanStart = preflightChecksAttempted && locationCheck.status === "成功";
+  const preflightCanStart = locationCheck.status === "成功";
   const activeFamilyConnectionsCount = familyConnections.filter((connection) => connection.status === "confirmed").length;
   const confirmedFamilyOptions = useMemo(() => {
     if (!user) {
@@ -594,6 +627,11 @@ export default function Home() {
     if (!user || !isSupabaseConfigured || !supabase) {
       return;
     }
+    if (!hasActiveLocalTrip) {
+      setActiveWakeRequest(null);
+      stopWakeTone();
+      return;
+    }
 
     const supabaseClient = supabase;
     const ownerCode = user.code;
@@ -612,7 +650,8 @@ export default function Home() {
         return;
       }
 
-      if (data) {
+      if (data && data.id !== lastHandledWakeRequestIdRef.current) {
+        lastHandledWakeRequestIdRef.current = data.id;
         setActiveWakeRequest(data as WakeRequestRow);
         setStrongAlert("家人正在呼叫你。請確認目前位置與下車狀態。");
         startWakeTone();
@@ -626,7 +665,7 @@ export default function Home() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [user]);
+  }, [user, hasActiveLocalTrip]);
 
   function createEvent(type: EventType, message: string): EventRecord {
     return {
@@ -723,6 +762,13 @@ export default function Home() {
     }
     eventGateRef.current.add(type);
     appendEvent(type, message);
+  }
+
+  function withTestedAt<T extends PreflightCheckState>(state: T): T {
+    return {
+      ...state,
+      lastTestedAt: new Date().toISOString()
+    };
   }
 
   function logStatusTransition(status: TripStatus, previousHealth: LocationHealth, health: LocationHealth) {
@@ -1040,18 +1086,22 @@ export default function Home() {
     setAudioCheck(initialAudioCheck);
     setVibrationCheck(initialVibrationCheck);
     setWakeLockCheck(initialWakeLockCheck);
+    setNotificationPermissionCheck(initialNotificationPermissionCheck);
+    setCloudConnectionCheck(initialCloudConnectionCheck);
+    setFamilyNotificationCheck(initialFamilyNotificationCheck);
+    setFamilyWakeCheck(initialFamilyWakeCheck);
   }
 
   function testLocation() {
     if (!isLikelySecureForGeolocation()) {
       const message = "目前不是 HTTPS，iPhone Safari 可能不會允許定位。建議部署到 Vercel 後測試。";
-      setLocationCheck({ status: "失敗", message });
+      setLocationCheck(withTestedAt({ status: "失敗", message }));
       appendEvent("定位測試失敗", message);
       return;
     }
     if (!("geolocation" in navigator)) {
       const message = "此瀏覽器可能不支援定位，或目前不是 HTTPS。";
-      setLocationCheck({ status: "不支援", message });
+      setLocationCheck(withTestedAt({ status: "不支援", message }));
       appendEvent("定位測試失敗", message);
       return;
     }
@@ -1066,12 +1116,12 @@ export default function Home() {
           updatedAt: new Date().toISOString()
         };
         const message = "定位可用";
-        setLocationCheck({ status: "成功", message, position: currentPosition });
+        setLocationCheck(withTestedAt({ status: "成功", message, position: currentPosition }));
         appendEvent("定位測試成功", `${message}：${formatPosition(currentPosition)}`);
       },
       (error) => {
         const message = getGeolocationFailureMessage(error);
-        setLocationCheck({ status: "失敗", message });
+        setLocationCheck(withTestedAt({ status: "失敗", message }));
         appendEvent("定位測試失敗", message);
       },
       {
@@ -1085,50 +1135,112 @@ export default function Home() {
   async function testAlertAudio() {
     const unlocked = await unlockAlertSound();
     if (unlocked.ok) {
-      const played = await playAlertSoundFor(5000);
+      const played = await playAlertSoundFor(1000);
       if (!played.ok) {
         const message = played.error ?? "提示音播放失敗，畫面仍會強提醒";
         setAudioStatus(message);
-        setAudioCheck({ status: "失敗", message });
+        setAudioCheck(withTestedAt({ status: "失敗", message }));
         appendEvent("提示音測試失敗", message);
         return;
       }
       setAudioStatus("提示音已解鎖");
       setTripAlertSoundStatus("已解鎖");
-      setAudioCheck({ status: "成功", message: "提示音已解鎖" });
+      setAudioCheck(withTestedAt({ status: "成功", message: "提示音已解鎖" }));
       appendEvent("提示音測試成功", "提示音已解鎖");
       return;
     }
 
-    const message = unlocked.error ?? "提示音被瀏覽器阻擋，請確認 iPhone 不是靜音模式，並再點一次測試提示音。";
+    const message = unlocked.error ?? "請先點擊按鈕解鎖音效。";
     setAudioStatus(message);
-    setAudioCheck({ status: "失敗", message });
+    setAudioCheck(withTestedAt({ status: "失敗", message }));
     appendEvent("提示音測試失敗", message);
   }
 
   function testVibration() {
     if (!("vibrate" in navigator)) {
-      const message = "此瀏覽器不支援網頁震動，iPhone Safari 常見此限制。";
-      setVibrationCheck({ status: "不支援", message });
+      const message = "此裝置或瀏覽器不支援網頁震動，iPhone 常見。";
+      setVibrationCheck(withTestedAt({ status: "警告", message }));
       appendEvent("震動不支援", message);
       return;
     }
 
-    navigator.vibrate([180, 80, 180]);
-    setVibrationCheck({ status: "成功", message: "已送出震動測試" });
+    navigator.vibrate(200);
+    setVibrationCheck(withTestedAt({ status: "成功", message: "已送出震動測試" }));
   }
 
   async function testWakeLock() {
     const enabled = await requestWakeLock();
     if (enabled) {
-      setWakeLockCheck({ status: "成功", message: "防鎖屏已啟用" });
+      setWakeLockCheck(withTestedAt({ status: "成功", message: "防鎖屏已啟用" }));
       appendEvent("防鎖屏啟用成功", "防鎖屏已啟用");
       return;
     }
 
-    const message = "此瀏覽器不支援防鎖屏，請保持畫面開啟。";
-    setWakeLockCheck({ status: "不支援", message });
+    const message = "此裝置或瀏覽器不支援防鎖屏，請手動保持畫面開啟。";
+    setWakeLockCheck(withTestedAt({ status: "警告", message }));
     appendEvent("防鎖屏啟用失敗", message);
+  }
+
+  async function testNotificationPermission() {
+    setNotificationPermissionCheck({ status: "測試中", message: "正在檢查通知權限..." });
+    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setNotificationPermissionCheck(
+        withTestedAt({ status: "警告", message: "此瀏覽器不支援完整 Web Push。iPhone 需加入主畫面後使用。" })
+      );
+      return;
+    }
+    const diagnostics = await getNotificationDiagnostics();
+    setNotificationDiagnostics(diagnostics);
+    if (Notification.permission === "granted") {
+      setNotificationPermissionCheck(withTestedAt({ status: "成功", message: "背景通知權限已啟用" }));
+      return;
+    }
+    if (Notification.permission === "denied") {
+      setNotificationPermissionCheck(withTestedAt({ status: "失敗", message: "通知權限已被拒絕，請到 Safari 網站設定調整。" }));
+      return;
+    }
+    setNotificationPermissionCheck(withTestedAt({ status: "警告", message: "尚未啟用通知，可到通知設定啟用。" }));
+  }
+
+  async function testCloudConnection() {
+    setCloudConnectionCheck({ status: "測試中", message: "正在測試雲端連線..." });
+    if (!supabase) {
+      setCloudConnectionCheck(withTestedAt({ status: "失敗", message: "Supabase 環境變數未設定。" }));
+      return;
+    }
+    const { error } = await supabase.from("trips").select("id").limit(1);
+    setCloudConnectionCheck(
+      withTestedAt(error ? { status: "失敗", message: error.message } : { status: "成功", message: "雲端連線正常" })
+    );
+  }
+
+  async function testFamilyNotificationPreflight() {
+    if (confirmedFamilyOptions.length === 0 && selectedTripRecipients.length === 0) {
+      setFamilyNotificationCheck(withTestedAt({ status: "警告", message: "尚未連線家人，略過。" }));
+      return;
+    }
+    const share = cloudShareRef.current;
+    if (share.status !== "active" || !share.shareCode) {
+      setFamilyNotificationCheck(withTestedAt({ status: "警告", message: "需要進行中共享行程才能送出家人通知測試。" }));
+      return;
+    }
+    setFamilyNotificationCheck({ status: "測試中", message: "正在測試家人通知..." });
+    try {
+      await testFamilyNotification();
+      setFamilyNotificationCheck(withTestedAt({ status: "成功", message: "已呼叫家人通知測試" }));
+    } catch (error) {
+      setFamilyNotificationCheck(withTestedAt({ status: "失敗", message: error instanceof Error ? error.message : "家人通知測試失敗" }));
+    }
+  }
+
+  function testFamilyWakePreflight() {
+    const canWake = confirmedFamilyOptions.some((option) => option.permissions.can_wake_me !== false);
+    if (!activeTrip || !canWake) {
+      setFamilyWakeCheck(withTestedAt({ status: "警告", message: "需要進行中行程與可呼叫權限。" }));
+      return;
+    }
+    testFamilyWake();
+    setFamilyWakeCheck(withTestedAt({ status: "成功", message: "已觸發家人呼叫測試" }));
   }
 
   function startOfficialTrip() {
@@ -1149,6 +1261,11 @@ export default function Home() {
     eventGateRef.current = new Set();
     tripStartedRef.current = false;
     autoCloudShareStartedRef.current = false;
+    arrivalCandidateStartedAtRef.current = null;
+    confirmedArrivalCompletedRef.current = false;
+    maybeArrivedCandidateStartedAtRef.current = null;
+    maybeArrivedNotifiedRef.current = false;
+    autoExtendedUntilRef.current = null;
     setOwnerTripMuted(false);
     setStrongAlert("正在等待第一次定位，成功後會進入旅程模式。");
     appendEvent(
@@ -1234,6 +1351,7 @@ export default function Home() {
       status
     });
     triggerMilestones(distanceMeters, tripRadius, tripArrivalRadius);
+    evaluateArrivalLifecycle(distanceMeters, tripArrivalRadius, destination);
   }
 
   function triggerMilestones(distanceMeters: number, tripRadius: number, tripArrivalRadius: number) {
@@ -1260,14 +1378,88 @@ export default function Home() {
     }
   }
 
-  function stopTrip() {
+  function evaluateArrivalLifecycle(distanceMeters: number, tripArrivalRadius: number, destination: Destination) {
+    const now = Date.now();
+    if (distanceMeters <= CONFIRMED_ARRIVAL_DISTANCE_METERS) {
+      maybeArrivedCandidateStartedAtRef.current = null;
+      if (!arrivalCandidateStartedAtRef.current) {
+        arrivalCandidateStartedAtRef.current = now;
+        setForegroundLocationMessage("已接近目的地，正在確認是否連續停留。");
+        return;
+      }
+      if (
+        !confirmedArrivalCompletedRef.current &&
+        now - arrivalCandidateStartedAtRef.current >= CONFIRMED_ARRIVAL_DURATION_MS
+      ) {
+        confirmedArrivalCompletedRef.current = true;
+        void completeConfirmedArrival(destination);
+      }
+      return;
+    }
+
+    if (arrivalCandidateStartedAtRef.current) {
+      arrivalCandidateStartedAtRef.current = null;
+      setForegroundLocationMessage("尚未確認抵達，會繼續更新位置。");
+    }
+
+    if (distanceMeters <= tripArrivalRadius) {
+      if (!maybeArrivedCandidateStartedAtRef.current) {
+        maybeArrivedCandidateStartedAtRef.current = now;
+        return;
+      }
+      if (!maybeArrivedNotifiedRef.current && now - maybeArrivedCandidateStartedAtRef.current >= MAYBE_ARRIVED_DELAY_MS) {
+        maybeArrivedNotifiedRef.current = true;
+        setStrongAlert("你可能已抵達目的地附近，請確認是否需要下車。");
+        playAlert();
+        appendEvent("已抵達", "可能已抵達目的地附近，尚未連續停留確認。");
+        const share = cloudShareRef.current;
+        if (share.status === "active") {
+          void notifyTripEvents(share.tripId, share.shareCode, "maybe_arrived");
+        }
+      }
+      return;
+    }
+
+    maybeArrivedCandidateStartedAtRef.current = null;
+    maybeArrivedNotifiedRef.current = false;
+  }
+
+  async function completeConfirmedArrival(destination: Destination) {
+    setStrongAlert("已確認抵達目的地附近，這趟行程將結束。");
+    playAlert();
+    appendEvent("已抵達", `${destination.name} 已連續停留確認抵達`);
+    const share = cloudShareRef.current;
+    if (share.status === "active") {
+      await notifyTripEvents(share.tripId, share.shareCode, "arrived");
+    }
+    const ended = await endCloudTrip("已抵達");
+    if (!ended) {
+      setStrongAlert("已確認抵達，但雲端結束同步失敗，請稍後再試。");
+      return;
+    }
     stopGeolocationWatch();
     releaseWakeLock();
     stopAlertSoundLoop();
-    setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
+    setActiveTrip(null);
+    setPreflightOpen(false);
+    setPreflightDestination(null);
+    setCloudShare((current) =>
+      current.status === "active" ? { ...current, status: "idle", message: "已確認抵達，行程已結束" } : current
+    );
+  }
+
+  async function stopTrip() {
     if (activeTrip) {
+      const ended = await endCloudTrip(activeTrip.status);
+      if (!ended) {
+        setStrongAlert("結束行程同步失敗，請稍後再試。");
+        return;
+      }
+      stopGeolocationWatch();
+      releaseWakeLock();
+      stopAlertSoundLoop();
+      setTripAlertSoundStatus(ownerTripMuted ? "已停止" : "已解鎖");
       appendEvent("停止行程", `${activeTrip.destination.name} 的行程已停止`);
-      void endCloudTrip(activeTrip.status);
     }
     setActiveTrip(null);
     setStrongAlert(null);
@@ -1276,6 +1468,11 @@ export default function Home() {
     setPreflightDestination(null);
     tripStartedRef.current = false;
     autoCloudShareStartedRef.current = false;
+    arrivalCandidateStartedAtRef.current = null;
+    confirmedArrivalCompletedRef.current = false;
+    maybeArrivedCandidateStartedAtRef.current = null;
+    maybeArrivedNotifiedRef.current = false;
+    autoExtendedUntilRef.current = null;
     setCloudShare((current) =>
       current.status === "active" ? { ...current, status: "idle", message: "共享行程已停止" } : current
     );
@@ -1565,16 +1762,81 @@ export default function Home() {
     if (!user) {
       return;
     }
+    setLocationCheck({ status: "測試中", message: "正在測試定位..." });
+    setAudioCheck({ status: "測試中", message: "正在測試提示音..." });
+    setVibrationCheck({ status: "測試中", message: "正在測試震動..." });
+    setWakeLockCheck({ status: "測試中", message: "正在測試防鎖屏..." });
+    setNotificationPermissionCheck({ status: "測試中", message: "正在測試背景通知..." });
+    setCloudConnectionCheck({ status: "測試中", message: "正在測試雲端連線..." });
+
+    const locationResult = await getLocationPreflightCheck();
+    const soundResult = await getSoundPreflightCheck();
+    const webPushResult = getWebPushPreflightCheck();
+    const serviceWorkerResult = await getServiceWorkerPreflightCheck();
+    const pushSubscriptionResult = await getPushSubscriptionPreflightCheck();
+    const wakeLockResult = getWakeLockPreflightCheck();
+    const vibrationResult = getVibrationPreflightCheck();
+    const cloudResult = await getCloudPreflightCheck();
+
+    setLocationCheck(
+      withTestedAt({
+        status: locationResult.status === "success" ? "成功" : "失敗",
+        message: locationResult.message
+      })
+    );
+    setAudioCheck(
+      withTestedAt({
+        status: soundResult.status === "success" ? "成功" : soundResult.status === "warning" ? "警告" : "失敗",
+        message: soundResult.message
+      })
+    );
+    setVibrationCheck(
+      withTestedAt({
+        status: vibrationResult.status === "success" ? "成功" : "警告",
+        message: vibrationResult.message
+      })
+    );
+    setWakeLockCheck(
+      withTestedAt({
+        status: wakeLockResult.status === "success" ? "成功" : "警告",
+        message: wakeLockResult.message
+      })
+    );
+    setNotificationPermissionCheck(
+      withTestedAt({
+        status: webPushResult.status === "success" && serviceWorkerResult.status === "success" && pushSubscriptionResult.status !== "failed" ? "成功" : "警告",
+        message: pushSubscriptionResult.message || webPushResult.message
+      })
+    );
+    setCloudConnectionCheck(
+      withTestedAt({
+        status: cloudResult.status === "success" ? "成功" : "失敗",
+        message: cloudResult.message
+      })
+    );
+    setFamilyNotificationCheck(
+      withTestedAt(
+        confirmedFamilyOptions.length > 0 || selectedTripRecipients.length > 0
+          ? { status: "警告", message: "有家人可通知；實際推播需在行程共享後測試。" }
+          : { status: "警告", message: "尚未連線家人，略過。" }
+      )
+    );
+    setFamilyWakeCheck(
+      withTestedAt(
+        activeTrip ? { status: "警告", message: "行程中可用測試模式驗證家人呼叫。" } : { status: "警告", message: "需要進行中行程與可呼叫權限。" }
+      )
+    );
 
     const results: PreflightCheckResult[] = [
       getHttpsPwaCheck(),
-      await getLocationPreflightCheck(),
-      await getSoundPreflightCheck(),
-      getWebPushPreflightCheck(),
-      await getServiceWorkerPreflightCheck(),
-      await getPushSubscriptionPreflightCheck(),
-      getWakeLockPreflightCheck(),
-      getVibrationPreflightCheck()
+      locationResult,
+      soundResult,
+      webPushResult,
+      serviceWorkerResult,
+      pushSubscriptionResult,
+      wakeLockResult,
+      vibrationResult,
+      cloudResult
     ];
 
     try {
@@ -1618,6 +1880,8 @@ export default function Home() {
       return;
     }
 
+    await maybeAutoExtendCloudTrip(destination);
+
     const approximate = getApproximateLocation(position.lat, position.lng);
     const { error } = await supabase
       .from("trips")
@@ -1656,7 +1920,48 @@ export default function Home() {
     }
   }
 
-  async function notifyTripEvents(tripId?: string, shareCode?: string) {
+  async function maybeAutoExtendCloudTrip(destination: Destination) {
+    const share = cloudShareRef.current;
+    if (!supabase || share.status !== "active" || !share.tripId || !share.expiresAt) {
+      return;
+    }
+
+    const expiresAtMs = new Date(share.expiresAt).getTime();
+    if (!Number.isFinite(expiresAtMs) || Date.now() < expiresAtMs || autoExtendedUntilRef.current === share.expiresAt) {
+      return;
+    }
+
+    const previousExpiresAt = share.expiresAt;
+    const nextExpiresAt = new Date(Date.now() + AUTO_EXTEND_MINUTES * 60_000).toISOString();
+    autoExtendedUntilRef.current = previousExpiresAt;
+    const { error } = await supabase
+      .from("trips")
+      .update({
+        expires_at: nextExpiresAt,
+        status: "行程中"
+      })
+      .eq("id", share.tripId);
+
+    if (error) {
+      setCloudShare((current) => ({ ...current, message: `行程延長失敗：${error.message}` }));
+      appendStatusEventOnce("雲端行程同步失敗", "行程有效時間自動延長失敗");
+      return;
+    }
+
+    setCloudShare((current) =>
+      current.status === "active"
+        ? {
+            ...current,
+            expiresAt: nextExpiresAt,
+            message: "行程仍在進行，已自動延長 30 分鐘"
+          }
+        : current
+    );
+    appendEvent("雲端行程同步成功", `${destination.name} 行程已自動延長 30 分鐘`);
+    void notifyTripEvents(share.tripId, share.shareCode, "auto_extended");
+  }
+
+  async function notifyTripEvents(tripId?: string, shareCode?: string, eventType?: string) {
     if (!tripId && !shareCode) {
       return;
     }
@@ -1669,7 +1974,8 @@ export default function Home() {
         },
         body: JSON.stringify({
           tripId,
-          shareCode
+          shareCode,
+          eventType
         })
       });
     } catch {
@@ -1843,20 +2149,20 @@ export default function Home() {
   async function endCloudTrip(status: string) {
     const share = cloudShareRef.current;
     if (!supabase || share.status !== "active" || !share.tripId) {
-      return;
+      return true;
     }
 
     const { error } = await supabase
       .from("trips")
       .update({
-        status: "ended",
+        status: status === "已抵達" ? "arrived" : "ended",
         ended_at: new Date().toISOString()
       })
       .eq("id", share.tripId);
 
     if (error) {
       appendStatusEventOnce("雲端行程同步失敗", "停止行程同步到 Supabase 失敗");
-      return;
+      return false;
     }
 
     appendEvent("停止家人共享", "雲端共享行程已標記結束");
@@ -1864,6 +2170,7 @@ export default function Home() {
       void notifyFamilyTripEvent(share.shareCode, "trip_ended");
       void stopOwnerTripNotifications();
     }
+    return true;
   }
 
   async function notifyFamilyTripEvent(shareCode: string, type: "trip_started" | "trip_ended") {
@@ -2257,6 +2564,7 @@ export default function Home() {
 
           {!activeTrip ? (
             <div className="stack">
+              <p className="step-label">Step 1：去哪裡</p>
               <form className="compact-destination-form" onSubmit={handleDestinationSubmit}>
                 <label>
                   目的地名稱
@@ -2328,6 +2636,7 @@ export default function Home() {
                 )}
               </div>
 
+              <p className="step-label">Step 2：何時提醒</p>
               <div className="radius-options">
                 {RADIUS_OPTIONS.map((option) => (
                   <button className={radiusMeters === option.value ? "selected" : ""} key={option.value} onClick={() => chooseAlertRadius(option.value)} type="button">
@@ -2387,6 +2696,7 @@ export default function Home() {
                 </details>
               </div>
               <div className="stack">
+                <p className="step-label">Step 3：通知誰</p>
                 <p className="eyebrow">通知家人</p>
                 {confirmedFamilyOptions.length === 0 ? (
                   <p className="muted">尚未連線家人。你仍可開始行程，之後用分享連結提供查看。</p>
@@ -2410,10 +2720,18 @@ export default function Home() {
               </div>
               <div className="preflight-summary-row">
                 <span>行前檢查：{preflightBadge}</span>
-                <button className="secondary-button small-button" onClick={() => { setSidebarSection("preflight"); setSidebarOpen(true); }} type="button">
-                  查看詳情
-                </button>
+                <div className="compact-actions">
+                  <button className="secondary-button small-button" onClick={runPreflightAll} type="button">
+                    一鍵測試
+                  </button>
+                  <button className="secondary-button small-button" onClick={() => { setSidebarSection("preflight"); setSidebarOpen(true); }} type="button">
+                    單項測試
+                  </button>
+                </div>
               </div>
+              {preflightResults.length > 0 && preflightResults.some((item) => item.status !== "success") ? (
+                <p className="warning">部分提醒功能尚未啟用，仍可開始行程，但提醒可能不完整。</p>
+              ) : null}
               {notificationState.status !== "已啟用" ? <p className="warning">尚未啟用背景通知，鎖屏後可能收不到提醒。仍可開始行程。</p> : null}
               <p className="muted">背景通知會透過系統通知提醒。畫面開著時，可額外播放提示聲。</p>
               <p className="muted">畫面開著時會持續更新位置；鎖屏或切到背景後，iPhone 可能暫停網頁定位。</p>
@@ -2539,7 +2857,9 @@ export default function Home() {
         notificationDiagnostics={notificationDiagnostics}
         notificationCenterItems={notificationCenterItems}
         notificationCenterMessage={notificationCenterMessage}
+        notificationPermissionCheck={notificationPermissionCheck}
         notificationState={notificationState}
+        cloudConnectionCheck={cloudConnectionCheck}
         onClearLocalNotificationCenter={clearLocalNotificationCenter}
         onClearTripMuteForTest={clearTripMuteForTest}
         onClose={() => setSidebarOpen(false)}
@@ -2565,7 +2885,11 @@ export default function Home() {
         onTestFamilyWake={testFamilyWake}
         onTestOwnerNotification={testOwnerNotification}
         onTestAlertAudio={testAlertAudio}
+        onTestCloudConnection={testCloudConnection}
+        onTestFamilyNotificationPreflight={testFamilyNotificationPreflight}
+        onTestFamilyWakePreflight={testFamilyWakePreflight}
         onTestLocation={testLocation}
+        onTestNotificationPermission={testNotificationPermission}
         onTestVibration={testVibration}
         onTestWakeLock={testWakeLock}
         ownerTripMuted={ownerTripMuted}
@@ -2577,6 +2901,8 @@ export default function Home() {
         preflightRadiusMeters={preflightRadiusMeters}
         preflightResults={preflightResults}
         preflightSummary={preflightSummary}
+        familyNotificationCheck={familyNotificationCheck}
+        familyWakeCheck={familyWakeCheck}
         setConnectionCode={setConnectionCode}
         setConnectionPermissions={setConnectionPermissions}
         tripAlertSoundStatus={tripAlertSoundStatus}
@@ -2950,14 +3276,10 @@ export default function Home() {
             <PreflightRow actionLabel="測試震動" label="震動" onAction={testVibration} state={vibrationCheck} />
             <PreflightRow actionLabel="嘗試防鎖屏" label="防鎖屏" onAction={testWakeLock} state={wakeLockCheck} />
           </div>
-          {preflightChecksAttempted ? (
-            <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={startOfficialTrip}>
-              正式開始旅程
-            </button>
-          ) : (
-            <p className="muted">請先完成上方檢查。震動與防鎖屏若不支援，仍可開始旅程。</p>
-          )}
-          {preflightChecksAttempted && locationCheck.status !== "成功" ? (
+          <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={startOfficialTrip}>
+            正式開始旅程
+          </button>
+          {locationCheck.status !== "成功" ? (
             <p className="warning">定位測試成功後才能正式開始旅程。</p>
           ) : null}
         </section>
@@ -3219,17 +3541,21 @@ function SettingsSidebar({
   activeTrip,
   audioCheck,
   cloudShare,
+  cloudConnectionCheck,
   connectionCode,
   connectionPermissions,
   diagnosticsWarningCount,
   events,
   familyConnectionMessage,
   familyConnections,
+  familyNotificationCheck,
+  familyWakeCheck,
   isOpen,
   locationCheck,
   notificationDiagnostics,
   notificationCenterItems,
   notificationCenterMessage,
+  notificationPermissionCheck,
   notificationState,
   onClearLocalNotificationCenter,
   onClearTripMuteForTest,
@@ -3256,7 +3582,11 @@ function SettingsSidebar({
   onTestFamilyWake,
   onTestOwnerNotification,
   onTestAlertAudio,
+  onTestCloudConnection,
+  onTestFamilyNotificationPreflight,
+  onTestFamilyWakePreflight,
   onTestLocation,
+  onTestNotificationPermission,
   onTestVibration,
   onTestWakeLock,
   ownerTripMuted,
@@ -3278,6 +3608,7 @@ function SettingsSidebar({
   activeSection: SidebarSection;
   activeTrip: ActiveTrip | null;
   audioCheck: PreflightCheckState;
+  cloudConnectionCheck: PreflightCheckState;
   cloudShare: CloudShareState;
   connectionCode: string;
   connectionPermissions: FamilyPermissions;
@@ -3285,11 +3616,14 @@ function SettingsSidebar({
   events: EventRecord[];
   familyConnectionMessage: string;
   familyConnections: FamilyConnectionRow[];
+  familyNotificationCheck: PreflightCheckState;
+  familyWakeCheck: PreflightCheckState;
   isOpen: boolean;
   locationCheck: LocationCheckState;
   notificationDiagnostics: NotificationDiagnostic[];
   notificationCenterItems: NotificationCenterItem[];
   notificationCenterMessage: string;
+  notificationPermissionCheck: PreflightCheckState;
   notificationState: NotificationState;
   onClearLocalNotificationCenter: () => void;
   onClearTripMuteForTest: () => void;
@@ -3316,7 +3650,11 @@ function SettingsSidebar({
   onTestFamilyWake: () => void;
   onTestOwnerNotification: () => void;
   onTestAlertAudio: () => void;
+  onTestCloudConnection: () => void;
+  onTestFamilyNotificationPreflight: () => void;
+  onTestFamilyWakePreflight: () => void;
   onTestLocation: () => void;
+  onTestNotificationPermission: () => void;
   onTestVibration: () => void;
   onTestWakeLock: () => void;
   ownerTripMuted: boolean;
@@ -3368,20 +3706,24 @@ function SettingsSidebar({
           </button>
           {preflightSummary ? <p className="form-notice">{preflightSummary}</p> : null}
           {preflightResults.length > 0 ? <PreflightResultList items={preflightResults} /> : null}
+          <div className="preflight-list">
+            <p className="eyebrow">單項測試</p>
+            <PreflightRow actionLabel="測試定位" detail={locationCheck.position ? `${formatPosition(locationCheck.position)}，${formatTime(locationCheck.position.updatedAt)}` : undefined} label="定位測試" onAction={onTestLocation} state={locationCheck} />
+            <PreflightRow actionLabel="測試提示音" label="提示音測試" onAction={onTestAlertAudio} state={audioCheck} />
+            <PreflightRow actionLabel="測試震動" label="震動測試" onAction={onTestVibration} state={vibrationCheck} />
+            <PreflightRow actionLabel="測試防鎖屏" label="防鎖屏測試" onAction={onTestWakeLock} state={wakeLockCheck} />
+            <PreflightRow actionLabel="測試通知權限" label="背景通知" onAction={onTestNotificationPermission} state={notificationPermissionCheck} />
+            <PreflightRow actionLabel="測試雲端連線" label="雲端連線" onAction={onTestCloudConnection} state={cloudConnectionCheck} />
+            <PreflightRow actionLabel="測試家人通知" label="家人通知" onAction={onTestFamilyNotificationPreflight} state={familyNotificationCheck} />
+            <PreflightRow actionLabel="測試家人呼叫" label="家人呼叫" onAction={onTestFamilyWakePreflight} state={familyWakeCheck} />
+          </div>
           {preflightOpen && preflightDestination ? (
             <div className="preflight-list">
               <p className="field-hint">準備前往 {preflightDestination.name}。定位測試成功後才能正式開始旅程。</p>
-              <PreflightRow actionLabel="測試定位" detail={locationCheck.position ? `${formatPosition(locationCheck.position)}，${formatTime(locationCheck.position.updatedAt)}` : undefined} label="定位" onAction={onTestLocation} state={locationCheck} />
-              <PreflightRow actionLabel="測試提示音" label="提示音" onAction={onTestAlertAudio} state={audioCheck} />
-              <PreflightRow actionLabel="測試震動" label="震動" onAction={onTestVibration} state={vibrationCheck} />
-              <PreflightRow actionLabel="嘗試防鎖屏" label="防鎖屏" onAction={onTestWakeLock} state={wakeLockCheck} />
-              {preflightChecksAttempted ? (
-                <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={onStartOfficialTrip} type="button">
-                  正式開始旅程
-                </button>
-              ) : (
-                <p className="muted">請先完成檢查。震動與防鎖屏若不支援，仍可開始旅程。</p>
-              )}
+              <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={onStartOfficialTrip} type="button">
+                正式開始旅程
+              </button>
+              {locationCheck.status !== "成功" ? <p className="warning">定位測試成功後才能正式開始旅程。</p> : null}
             </div>
           ) : null}
         </SidebarPanel>
@@ -3743,22 +4085,25 @@ function FamilyTripsPanel({
             : trips.map((trip) => ({ ownerCode: trip.owner_code, connection: null, trip }))
           ).map((item) => {
             const permissions = item.trip?.permissions;
-            const canWake = permissions?.can_wake_me !== false;
+            const activeFamilyTrip = item.trip && isTripActive(item.trip) ? item.trip : null;
+            const canWake = permissions?.can_wake_me !== false && canWakeOwner(activeFamilyTrip);
             return (
               <div className="family-row" key={item.ownerCode}>
                 <div>
                   <strong>{item.ownerCode}</strong>
                   <span>{item.connection ? getConnectionStatusLabel(item.connection) : "分享行程"}</span>
                   <p className="field-hint">
-                    {item.trip ? `${getPublicLocationStatus(item.trip.last_location_at ?? undefined)}，最近更新：${formatTime(item.trip.last_location_at ?? undefined)}` : "這位家人目前沒有進行中的行程。"}
+                    {activeFamilyTrip
+                      ? `${getTripDisplayStatus(activeFamilyTrip)}，最近更新：${formatTime(activeFamilyTrip.last_location_at ?? undefined)}`
+                      : "這位家人目前沒有進行中的行程。"}
                   </p>
                 </div>
                 <div className="family-row-actions">
                   <button className="primary-button" onClick={() => (onViewOwner ? onViewOwner(item.ownerCode) : item.trip && (window.location.href = `/share/${item.trip.share_code}`))} type="button">
                     查看目前行程
                   </button>
-                  {canWake && item.trip ? (
-                    <button className="secondary-button" onClick={() => (window.location.href = `/share/${item.trip?.share_code}`)} type="button">
+                  {canWake && activeFamilyTrip ? (
+                    <button className="secondary-button" onClick={() => (window.location.href = `/share/${activeFamilyTrip.share_code}`)} type="button">
                       呼叫
                     </button>
                   ) : null}
@@ -3790,6 +4135,8 @@ function PreflightRow({
       <div>
         <span>{label}</span>
         <strong>{state.message}</strong>
+        <p className={getPreflightStateClass(state.status)}>{state.status}</p>
+        {state.lastTestedAt ? <p>最後測試：{formatTime(state.lastTestedAt)}</p> : null}
         {detail ? <p>{detail}</p> : null}
       </div>
       <button className="secondary-button" disabled={state.status === "測試中"} onClick={onAction} type="button">
@@ -3852,6 +4199,35 @@ async function getLocationPreflightCheck(): Promise<PreflightCheckResult> {
       { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
     );
   });
+}
+
+async function getCloudPreflightCheck(): Promise<PreflightCheckResult> {
+  if (!supabase) {
+    return {
+      key: "cloud",
+      label: "雲端連線",
+      status: "failed",
+      message: "Supabase 環境變數未設定。",
+      suggestion: "仍可本機測試，但家人共享與通知需要雲端連線。"
+    };
+  }
+  const { error } = await supabase.from("trips").select("id").limit(1);
+  if (error) {
+    return {
+      key: "cloud",
+      label: "雲端連線",
+      status: "failed",
+      message: error.message,
+      suggestion: "請確認 Supabase URL、anon key 與 RLS policy。"
+    };
+  }
+  return {
+    key: "cloud",
+    label: "雲端連線",
+    status: "success",
+    message: "雲端連線正常。",
+    suggestion: ""
+  };
 }
 
 async function getSoundPreflightCheck(): Promise<PreflightCheckResult> {
@@ -4016,6 +4392,19 @@ function getPreflightSummaryLabel(items: PreflightCheckResult[]) {
     return `有 ${warnings} 個警告`;
   }
   return "通過";
+}
+
+function getPreflightStateClass(status: PreflightStatus) {
+  if (status === "成功") {
+    return "good";
+  }
+  if (status === "警告" || status === "不支援") {
+    return "warning";
+  }
+  if (status === "失敗") {
+    return "warning";
+  }
+  return "field-hint";
 }
 
 function getPublicLocationStatus(updatedAt?: string, ended = false) {

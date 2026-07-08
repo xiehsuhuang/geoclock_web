@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import webpush from "web-push";
+import { buildTripStartedNotification } from "@/lib/notificationText";
 import { supabase } from "@/lib/supabaseClient";
+import { isTripActive } from "@/lib/tripStatus";
 
 export const runtime = "nodejs";
 
@@ -40,11 +42,14 @@ export async function POST(request: Request) {
 
   const { data: trip, error: tripError } = await supabase
     .from("trips")
-    .select("id, share_code, owner_code, ended_at, status, expires_at")
+    .select("id, share_code, owner_code, destination_name, destination_address, ended_at, status, expires_at")
     .eq("share_code", shareCode)
     .maybeSingle();
   if (tripError || !trip) {
     return NextResponse.json({ ok: false, error: tripError?.message ?? "找不到行程。", sent: 0, failed: 0, skippedCooldown: 0 }, { status: 404 });
+  }
+  if (type !== "trip_ended" && !isTripActive(trip)) {
+    return NextResponse.json({ ok: true, sent: 0, failed: 0, skippedCooldown: 0, skippedReason: "trip_not_active" });
   }
 
   const viewerCodes = await getNotificationViewerCodes(trip.owner_code, trip.share_code, type);
@@ -67,9 +72,12 @@ export async function POST(request: Request) {
   let failed = 0;
   let skippedCooldown = 0;
   const errors: string[] = [];
+  const content =
+    type === "trip_started"
+      ? buildTripStartedNotification(trip)
+      : { title: "GeoClock 行程結束", body: `${trip.owner_code || "對方"} 已結束這趟行程。` };
   const notificationPayload = JSON.stringify({
-    title: type === "trip_started" ? "GeoClock 行程開始" : "GeoClock 行程結束",
-    body: type === "trip_started" ? "對方已開始一趟行程，你可以打開 GeoClock 查看狀態。" : "對方已結束這趟行程。",
+    ...content,
     type,
     owner_code: trip.owner_code,
     share_code: trip.share_code,

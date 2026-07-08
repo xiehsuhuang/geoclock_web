@@ -6,6 +6,7 @@ import { formatDistance } from "@/lib/geo";
 import { getNotificationDiagnostics, getStandaloneHint, urlBase64ToUint8Array } from "@/lib/notificationDiagnostics";
 import { playAlertSoundFor, startAlertSoundLoop, stopAlertSoundLoop, unlockAlertSound } from "@/lib/sound";
 import { isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
+import { canWakeOwner, getTripDisplayStatus, isTripActive, isTripEnded, isTripExpired } from "@/lib/tripStatus";
 import type { CloudTripRow, CurrentPosition, Destination, NotificationDiagnostic } from "@/lib/types";
 
 const TripMap = dynamic(() => import("@/components/TripMap"), {
@@ -26,7 +27,7 @@ type ShareNotificationState = {
   message: string;
 };
 
-type WakeStatus = "idle" | "calling" | "acknowledged" | "ended" | "error";
+type WakeStatus = "idle" | "sending" | "sent" | "error";
 
 const VIEWER_CODE_STORAGE_KEY = "geoclock.web.viewerCode";
 const SHARE_POLL_INTERVAL_MS = 15_000;
@@ -169,8 +170,7 @@ function SharedTripView({
   trip: CloudTripRow;
 }) {
   const [wakeStatus, setWakeStatus] = useState<WakeStatus>("idle");
-  const [wakeMessage, setWakeMessage] = useState("這會連續推播提醒對方，最多 15 秒。");
-  const [wakeCount, setWakeCount] = useState(0);
+  const [wakeMessage, setWakeMessage] = useState("每按一次呼叫，會送出一次通知給對方。");
   const [wakeDetail, setWakeDetail] = useState("");
   const [notificationState, setNotificationState] = useState<ShareNotificationState>({
     status: "尚未啟用",
@@ -181,10 +181,12 @@ function SharedTripView({
   const [viewerTripMuted, setViewerTripMuted] = useState(false);
   const [viewerAlertSoundStatus, setViewerAlertSoundStatus] = useState<"尚未測試" | "已解鎖" | "提醒中" | "本趟已停止">("尚未測試");
   const [viewerAlertMessage, setViewerAlertMessage] = useState("畫面開著時會響；背景只會收到系統通知。");
-  const wakeRequestIdRef = useRef<string | null>(null);
-  const wakeStoppedRef = useRef(false);
   const health = getSharedHealth(trip);
   const statusLabel = getShareStatusLabel(trip);
+  const tripActive = isTripActive(trip);
+  const tripEnded = isTripEnded(trip);
+  const tripExpired = isTripExpired(trip);
+  const viewerCanWake = canWakeOwner(trip);
   const destination = useMemo<Destination>(
     () => ({
       id: trip.share_code,
@@ -243,7 +245,7 @@ function SharedTripView({
 
   useEffect(() => {
     const shouldAlert = isViewerAlertCondition(trip, health);
-    if (!shouldAlert || viewerTripMuted) {
+    if (!tripActive || !shouldAlert || viewerTripMuted) {
       stopAlertSoundLoop();
       setViewerAlertSoundStatus(viewerTripMuted ? "本趟已停止" : "已解鎖");
       return;
@@ -255,7 +257,7 @@ function SharedTripView({
       intervalMs: 10000,
       onError: (error) => setViewerAlertMessage(`提醒聲播放失敗：${error}`)
     });
-  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, trip.ended_at, health, viewerTripMuted]);
+  }, [trip.distance_m, trip.alert_radius_m, trip.arrival_radius_m, trip.last_location_at, trip.ended_at, trip.expires_at, health, viewerTripMuted, tripActive]);
 
   async function refreshViewerMuteStatus() {
     const endpoint = await getCurrentPushEndpoint();
@@ -408,41 +410,19 @@ function SharedTripView({
   }
 
   async function callOwner() {
-    if (wakeStatus === "calling") {
+    if (wakeStatus === "sending") {
+      return;
+    }
+    if (!canWakeOwner(trip)) {
+      setWakeStatus("error");
+      setWakeMessage("這趟行程已結束或已失效，不能再呼叫對方。");
       return;
     }
 
-    wakeStoppedRef.current = false;
-    wakeRequestIdRef.current = null;
-    setWakeStatus("calling");
-    setWakeCount(0);
-    setWakeMessage("呼叫中...");
+    setWakeStatus("sending");
+    setWakeMessage("正在送出呼叫...");
     setWakeDetail("");
 
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      if (wakeStoppedRef.current) {
-        break;
-      }
-
-      const sent = await sendWakeAttempt(attempt);
-      if (!sent || wakeStoppedRef.current || attempt === 5) {
-        break;
-      }
-
-      await delay(3000);
-      const acknowledged = await refreshWakeStatus();
-      if (acknowledged) {
-        break;
-      }
-    }
-
-    if (!wakeStoppedRef.current && wakeStatus !== "acknowledged") {
-      setWakeStatus("ended");
-      setWakeMessage("呼叫結束。");
-    }
-  }
-
-  async function sendWakeAttempt(attempt: number) {
     try {
       const response = await fetch("/api/wake/request", {
         method: "POST",
@@ -451,11 +431,11 @@ function SharedTripView({
         },
         body: JSON.stringify({
           shareCode: trip.share_code,
-          wakeRequestId: wakeRequestIdRef.current,
           fromViewerCode: viewerCode || undefined
         })
       });
       const payload = (await response.json()) as {
+        ok?: boolean;
         id?: string;
         status?: string;
         message?: string;
@@ -471,53 +451,18 @@ function SharedTripView({
         setWakeDetail(formatWakeDiagnostics(payload.diagnostics));
       }
 
-      if (!response.ok) {
+      if (!response.ok || !payload.ok) {
         setWakeStatus("error");
         setWakeMessage(payload.message ?? "呼叫失敗，請稍後再試。");
-        wakeStoppedRef.current = true;
-        return false;
+        return;
       }
 
-      if (payload.id) {
-        wakeRequestIdRef.current = payload.id;
-      }
-      if (payload.status === "acknowledged") {
-        setWakeStatus("acknowledged");
-        setWakeMessage("對方已回應。");
-        wakeStoppedRef.current = true;
-        return false;
-      }
-
-      setWakeCount(attempt);
-      setWakeMessage(`呼叫中，已送出第 ${attempt} 次提醒。`);
-      return true;
+      setWakeStatus("sent");
+      setWakeMessage("已送出呼叫。");
     } catch (error) {
       setWakeStatus("error");
       setWakeMessage(`呼叫失敗：${error instanceof Error ? error.message : "未知錯誤"}`);
-      wakeStoppedRef.current = true;
-      return false;
     }
-  }
-
-  async function refreshWakeStatus() {
-    if (!wakeRequestIdRef.current) {
-      return false;
-    }
-
-    try {
-      const response = await fetch(`/api/wake/status?id=${encodeURIComponent(wakeRequestIdRef.current)}`);
-      const payload = (await response.json()) as { status?: string };
-      if (payload.status === "acknowledged") {
-        setWakeStatus("acknowledged");
-        setWakeMessage("對方已回應。");
-        wakeStoppedRef.current = true;
-        return true;
-      }
-    } catch {
-      return false;
-    }
-
-    return false;
   }
 
   return (
@@ -578,7 +523,17 @@ function SharedTripView({
         <p className={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援" ? "warning" : "muted"}>
           {notificationState.message}
         </p>
+        {!tripActive ? (
+          <p className="warning">
+            {tripEnded
+              ? "這趟行程已由對方結束，不能再呼叫。"
+              : tripExpired
+                ? "這趟行程已超過有效時間，不能再呼叫。"
+                : "這趟行程目前不可互動。"}
+          </p>
+        ) : null}
         <p className={viewerTripMuted ? "good" : "muted"}>{viewerAlertMessage}</p>
+        {tripActive ? (
         <div className="trip-actions">
           <button className="primary-button" onClick={enableViewerNotifications} type="button">
             啟用家人通知
@@ -586,15 +541,16 @@ function SharedTripView({
           <button className="secondary-button" onClick={testViewerAlertSound} type="button">
             測試提醒聲
           </button>
-          <button className="secondary-button" disabled={wakeStatus === "calling" || Boolean(trip.ended_at)} onClick={callOwner} type="button">
+          <button className="secondary-button" disabled={wakeStatus === "sending" || !viewerCanWake} onClick={callOwner} type="button">
             呼叫對方
           </button>
           <button className="secondary-button" disabled={viewerTripMuted} onClick={stopViewerTripNotifications} type="button">
             收到，停止本趟通知
           </button>
         </div>
+        ) : null}
         <p className={wakeStatus === "error" ? "warning" : "muted"}>{wakeMessage}</p>
-        {wakeStatus === "calling" ? <p className="muted">已送出第 {wakeCount} 次提醒。</p> : null}
+        {wakeStatus === "sent" ? <p className="muted">本次呼叫已送出 1 次通知。可以再次按呼叫送出下一次。</p> : null}
         {wakeDetail ? <p className="field-hint">{wakeDetail}</p> : null}
       </section>
 
@@ -621,10 +577,6 @@ function SharedTripView({
       </details>
     </main>
   );
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function DiagnosticList({ items }: { items: NotificationDiagnostic[] }) {
@@ -689,11 +641,11 @@ function formatWakeDiagnostics(diagnostics: { ownerSubscriptions: number; pushSu
 }
 
 function getSharedHealth(trip: CloudTripRow) {
-  if (trip.ended_at || trip.status === "ended") {
+  if (isTripEnded(trip)) {
     return "ended";
   }
-  if (trip.expires_at && Date.now() >= new Date(trip.expires_at).getTime()) {
-    return "expired";
+  if (isTripExpired(trip)) {
+    return "needs_extend";
   }
   if (!trip.last_location_at) {
     return "unknown";
@@ -715,12 +667,13 @@ function getSharedHealth(trip: CloudTripRow) {
 }
 
 function getShareStatusLabel(trip: CloudTripRow) {
-  const health = getSharedHealth(trip);
-  if (health === "ended") {
-    return "行程已結束";
+  const lifecycleStatus = getTripDisplayStatus(trip);
+  if (lifecycleStatus === "行程已結束" || lifecycleStatus === "行程有效時間已到，正在嘗試延長") {
+    return lifecycleStatus;
   }
-  if (health === "expired") {
-    return "行程可能已失效";
+  const health = getSharedHealth(trip);
+  if (health === "needs_extend") {
+    return "行程有效時間已到，等待對方回到畫面更新";
   }
   if (health === "lost") {
     return "定位可能中斷";
@@ -732,7 +685,7 @@ function getShareStatusLabel(trip: CloudTripRow) {
 }
 
 function isViewerAlertCondition(trip: CloudTripRow, health: string) {
-  if (trip.ended_at || trip.status === "ended") {
+  if (!isTripActive(trip)) {
     return false;
   }
   const arrivalRadiusMeters = trip.arrival_radius_m ?? 100;
