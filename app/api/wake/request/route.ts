@@ -141,8 +141,9 @@ export async function POST(request: Request) {
     );
   }
 
+  const callerDisplayName = await getUserDisplayName(viewerCode);
   const notificationPayload = JSON.stringify({
-    ...buildWakeRequestNotification(),
+    ...buildWakeRequestNotification(callerDisplayName),
     url: "/",
     tag: `geoclock-wake-${created.id}`
   });
@@ -266,4 +267,12 @@ function isWakeableTripStatus(status?: string | null) {
     "定位延遲",
     "定位中斷"
   ].includes(status);
+}
+
+async function getUserDisplayName(userCode: string) {
+  if (!supabase) {
+    return null;
+  }
+  const { data } = await supabase.from("users").select("display_name").eq("user_code", userCode).maybeSingle();
+  return (data as { display_name?: string | null } | null)?.display_name ?? null;
 }

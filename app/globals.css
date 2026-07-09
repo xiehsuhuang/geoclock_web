@@ -653,6 +653,22 @@ p {
   margin-bottom: 12px;
 }
 
+.notification-type-list {
+  display: grid;
+  gap: 12px;
+}
+
+.notification-type-list ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.notification-type-list li {
+  margin: 6px 0;
+  line-height: 1.55;
+}
+
 .future-search-row span {
   color: var(--muted);
   font-size: 0.9rem;

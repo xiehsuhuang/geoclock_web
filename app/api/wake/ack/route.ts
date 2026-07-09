@@ -49,7 +49,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, status: "acknowledged", alreadyAcknowledged: true });
   }
 
-  const pushResult = await notifyRequester(wakeRequest);
+  const pushResult = await notifyRequester({ ...wakeRequest, acknowledged_at: nowIso });
   return NextResponse.json({
     ok: true,
     status: "acknowledged",
@@ -144,7 +144,7 @@ async function notifyRequester(wakeRequest: WakeRequestRow) {
     .select("display_name")
     .eq("user_code", wakeRequest.to_owner_code)
     .maybeSingle();
-  const content = buildWakeAcknowledgedNotification((owner as { display_name?: string } | null)?.display_name);
+  const content = buildWakeAcknowledgedNotification((owner as { display_name?: string } | null)?.display_name, wakeRequest.acknowledged_at);
 
   const { data: subscriptions, error } = await supabase
     .from("push_subscriptions")

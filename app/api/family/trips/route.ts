@@ -90,8 +90,15 @@ export async function GET(request: Request) {
   }
 
   const tripRows = (trips ?? []) as TripRow[];
+  const visibleShareCodes = await getVisibleShareCodesForViewer(
+    viewerCode,
+    tripRows.map((trip) => trip.share_code)
+  );
   const latestTripByOwner = new Map<string, TripRow>();
   for (const trip of tripRows) {
+    if (!visibleShareCodes.has(trip.share_code)) {
+      continue;
+    }
     if (!latestTripByOwner.has(trip.owner_code)) {
       latestTripByOwner.set(trip.owner_code, trip);
     }
@@ -153,26 +160,8 @@ async function getSingleFamilyTrip({
   }
 
   const connection = rows.find((row) => getOtherCode(row, viewerCode) === ownerCode);
-  const recipientPermission = await getTripRecipientPermission(ownerCode, viewerCode);
-  const permissions = connection
-    ? getOwnerGrantedPermissions(connection, ownerCode)
-    : recipientPermission
-      ? getRecipientDefaultPermissions()
-      : {};
+  const permissions = connection ? getOwnerGrantedPermissions(connection, ownerCode) : {};
   const connectedCanView = Boolean(connection && permissions.can_view_status !== false);
-  const recipientCanView = Boolean(recipientPermission?.can_view);
-
-  if (!connectedCanView && !recipientCanView && !shareCode) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "你尚未與這位家人完成連線。請先互相加入代號，或請對方提供行程分享連結。",
-        trips: [],
-        families: []
-      },
-      { status: 403 }
-    );
-  }
 
   const since = new Date(Date.now() - ACTIVE_TRIP_WINDOW_MS).toISOString();
   const nowIso = new Date().toISOString();
@@ -207,19 +196,36 @@ async function getSingleFamilyTrip({
     });
   }
 
-  const trip = decorateTrip(data as TripRow, permissions);
+  const recipientPermission = await getTripRecipientPermission((data as TripRow).share_code, viewerCode);
+  const recipientCanView = Boolean(recipientPermission?.can_view);
+  if (!recipientCanView && !(shareCode && connectedCanView)) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: shareCode
+          ? "你沒有這趟行程的查看權限，請確認已完成家人連線或請對方重新分享。"
+          : "你尚未被加入這趟行程的可查看家人，請對方在出發前勾選你。",
+        trips: [],
+        families: []
+      },
+      { status: 403 }
+    );
+  }
+
+  const viewPermissions = recipientCanView && !connection ? getRecipientDefaultPermissions() : permissions;
+  const trip = decorateTrip(data as TripRow, viewPermissions);
   return NextResponse.json({
     ok: true,
     trips: [trip],
     trip,
     families: [
       {
-        owner_code: ownerCode,
-        connection_status: connection?.status ?? "share_code",
-        permissions,
-        trip
-      }
-    ]
+          owner_code: ownerCode,
+          connection_status: connection?.status ?? "share_code",
+          permissions: viewPermissions,
+          trip
+        }
+      ]
   });
 }
 
@@ -248,7 +254,7 @@ function getOwnerGrantedPermissions(connection: FamilyConnectionRow, ownerCode: 
   return ownerCode === connection.user_a_code ? connection.user_a_permissions ?? {} : connection.user_b_permissions ?? {};
 }
 
-async function getTripRecipientPermission(ownerCode: string, viewerCode: string) {
+async function getTripRecipientPermission(shareCode: string, viewerCode: string) {
   if (!supabase) {
     return null;
   }
@@ -256,7 +262,7 @@ async function getTripRecipientPermission(ownerCode: string, viewerCode: string)
   const { data } = await supabase
     .from("trip_recipients")
     .select("can_view,can_receive_notifications")
-    .eq("owner_code", ownerCode)
+    .eq("share_code", shareCode)
     .eq("recipient_code", viewerCode)
     .eq("can_view", true)
     .order("created_at", { ascending: false })
@@ -264,6 +270,19 @@ async function getTripRecipientPermission(ownerCode: string, viewerCode: string)
     .maybeSingle();
 
   return data as { can_view: boolean; can_receive_notifications: boolean } | null;
+}
+
+async function getVisibleShareCodesForViewer(viewerCode: string, shareCodes: string[]) {
+  if (!supabase || shareCodes.length === 0) {
+    return new Set<string>();
+  }
+  const { data } = await supabase
+    .from("trip_recipients")
+    .select("share_code")
+    .eq("recipient_code", viewerCode)
+    .eq("can_view", true)
+    .in("share_code", shareCodes);
+  return new Set(((data ?? []) as { share_code: string }[]).map((row) => row.share_code));
 }
 
 function getRecipientDefaultPermissions(): FamilyPermissions {

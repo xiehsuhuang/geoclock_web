@@ -31,6 +31,8 @@ type TripEventRow = {
   started_at: string | null;
   ended_at: string | null;
   expires_at: string | null;
+  owner_display_name?: string | null;
+  arrived_at?: string | null;
 };
 
 type PushSubscriptionRow = {
@@ -40,13 +42,6 @@ type PushSubscriptionRow = {
   endpoint: string;
   p256dh: string;
   auth: string;
-};
-
-type FamilyConnectionRow = {
-  user_a_code: string;
-  user_b_code: string;
-  user_a_permissions: Record<string, boolean> | null;
-  user_b_permissions: Record<string, boolean> | null;
 };
 
 type NotificationEventType = "near_destination" | "arrived" | "location_lost" | "maybe_arrived" | "auto_extended";
@@ -108,7 +103,12 @@ export async function POST(request: Request) {
     );
   }
 
+  const forcedEvent = isNotificationEventType(payload.eventType) ? payload.eventType : null;
   const trip = tripData as TripEventRow;
+  trip.owner_display_name = await getUserDisplayName(trip.owner_code);
+  if (!trip.arrived_at && forcedEvent === "arrived") {
+    trip.arrived_at = new Date().toISOString();
+  }
   if (isTripEnded(trip)) {
     return NextResponse.json({ ...result, skippedReason: "trip_ended", skippedEndedCount: 1 });
   }
@@ -116,7 +116,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ ...result, skippedReason: "trip_needs_auto_extend", skippedEndedCount: 1 });
   }
 
-  const forcedEvent = isNotificationEventType(payload.eventType) ? payload.eventType : null;
   const targetEvents = forcedEvent ? [forcedEvent] : getTargetEvents(trip);
   result.checkedEvents = targetEvents;
   if (targetEvents.length === 0) {
@@ -235,17 +234,23 @@ async function getRecipients(trip: TripEventRow, eventType: NotificationEventTyp
   }
 
   const baseRecipients = ((subscriptions ?? []) as PushSubscriptionRow[])
-    .filter((subscription) => subscription.endpoint && subscription.p256dh && subscription.auth)
+    .filter(
+      (subscription) =>
+        subscription.user_code === trip.owner_code &&
+        subscription.role !== "viewer" &&
+        subscription.endpoint &&
+        subscription.p256dh &&
+        subscription.auth
+    )
     .map((subscription) => ({
-      role: subscription.role === "viewer" ? "viewer" : "owner",
-      code: subscription.role === "viewer" ? subscription.user_code : trip.owner_code,
+      role: "owner" as const,
+      code: trip.owner_code,
       endpoint: subscription.endpoint,
       subscription
     })) satisfies Recipient[];
 
-  const familyRecipients = await getFamilyRecipients(trip.owner_code);
   const selectedRecipients = await getTripSelectedRecipients(trip.share_code);
-  const allRecipients = dedupeRecipients([...baseRecipients, ...familyRecipients, ...selectedRecipients]);
+  const allRecipients = dedupeRecipients([...baseRecipients, ...selectedRecipients]);
   if (eventType === "maybe_arrived" || eventType === "auto_extended") {
     return allRecipients.filter((recipient) => recipient.role === "owner");
   }
@@ -271,46 +276,6 @@ async function getTripSelectedRecipients(shareCode: string): Promise<Recipient[]
     .from("push_subscriptions")
     .select("role, user_code, share_code, endpoint, p256dh, auth")
     .in("user_code", codes);
-
-  return ((subscriptions ?? []) as PushSubscriptionRow[])
-    .filter((subscription) => subscription.endpoint && subscription.p256dh && subscription.auth)
-    .map((subscription) => ({
-      role: "viewer",
-      code: subscription.user_code,
-      endpoint: subscription.endpoint,
-      subscription: {
-        ...subscription,
-        role: "viewer"
-      }
-    }));
-}
-
-async function getFamilyRecipients(ownerCode: string): Promise<Recipient[]> {
-  if (!supabase) {
-    return [];
-  }
-
-  const { data: connections } = await supabase
-    .from("family_connections")
-    .select("user_a_code,user_b_code,user_a_permissions,user_b_permissions")
-    .or(`user_a_code.eq.${ownerCode},user_b_code.eq.${ownerCode}`)
-    .eq("status", "confirmed");
-
-  const viewerCodes = ((connections ?? []) as FamilyConnectionRow[])
-    .filter((connection) => {
-      const permissions = connection.user_a_code === ownerCode ? connection.user_a_permissions : connection.user_b_permissions;
-      return permissions?.can_receive_notifications === true;
-    })
-    .map((connection) => (connection.user_a_code === ownerCode ? connection.user_b_code : connection.user_a_code));
-
-  if (viewerCodes.length === 0) {
-    return [];
-  }
-
-  const { data: subscriptions } = await supabase
-    .from("push_subscriptions")
-    .select("role, user_code, share_code, endpoint, p256dh, auth")
-    .in("user_code", viewerCodes);
 
   return ((subscriptions ?? []) as PushSubscriptionRow[])
     .filter((subscription) => subscription.endpoint && subscription.p256dh && subscription.auth)
@@ -457,6 +422,14 @@ function getNotificationContent(role: "owner" | "viewer", eventType: Notificatio
     title: "GeoClock 到站提醒",
     body: `${ownerName} 快到目的地了，${distanceText}`
   };
+}
+
+async function getUserDisplayName(userCode: string) {
+  if (!supabase) {
+    return null;
+  }
+  const { data } = await supabase.from("users").select("display_name").eq("user_code", userCode).maybeSingle();
+  return (data as { display_name?: string | null } | null)?.display_name ?? null;
 }
 
 function isNotificationEventType(eventType: unknown): eventType is NotificationEventType {

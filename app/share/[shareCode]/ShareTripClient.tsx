@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDistance } from "@/lib/geo";
 import { getNotificationDiagnostics, getStandaloneHint, urlBase64ToUint8Array } from "@/lib/notificationDiagnostics";
@@ -169,6 +170,7 @@ function SharedTripView({
   refreshing: boolean;
   trip: CloudTripRow;
 }) {
+  const router = useRouter();
   const [wakeStatus, setWakeStatus] = useState<WakeStatus>("idle");
   const [wakeMessage, setWakeMessage] = useState("每按一次呼叫，會送出一次通知給對方。");
   const [wakeDetail, setWakeDetail] = useState("");
@@ -186,10 +188,11 @@ function SharedTripView({
   const tripEnded = isTripEnded(trip);
   const tripExpired = isTripExpired(trip);
   const viewerCanWake = canWakeOwner(trip);
+  const destinationLabel = getDestinationLabel(trip);
   const destination = useMemo<Destination>(
     () => ({
       id: trip.share_code,
-      name: trip.destination_name,
+      name: destinationLabel,
       address: trip.destination_address ?? "",
       lat: trip.destination_lat,
       lng: trip.destination_lng,
@@ -197,16 +200,9 @@ function SharedTripView({
       updatedAt: trip.started_at,
       lastUsedAt: trip.started_at
     }),
-    [trip]
+    [destinationLabel, trip]
   );
-  const currentPosition: CurrentPosition | undefined =
-    typeof trip.approximate_lat === "number" && typeof trip.approximate_lng === "number"
-      ? {
-          lat: trip.approximate_lat,
-          lng: trip.approximate_lng,
-          updatedAt: trip.last_location_at ?? trip.started_at
-        }
-      : undefined;
+  const familyPosition = getFamilyPosition(trip);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -408,9 +404,20 @@ function SharedTripView({
     }
   }
 
+  function safeBack() {
+    if (window.history.length > 1) {
+      router.back();
+      return;
+    }
+    router.push("/");
+  }
+
   return (
     <main className="app-shell share-shell">
       <header className="topbar">
+        <button className="secondary-button small-button" onClick={safeBack} type="button">
+          返回
+        </button>
         <div>
           <p className="eyebrow">GeoClock 家人查看</p>
           <h1>{statusLabel}</h1>
@@ -429,9 +436,10 @@ function SharedTripView({
         <p className="eyebrow">行程狀態</p>
         <div className="status-grid">
           <Metric label="狀態" value={statusLabel} />
-          <Metric label="目的地" value={trip.destination_name} />
+          <Metric label="目的地" value={destinationLabel} />
           <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
           <Metric label="最後位置更新" value={formatDateTime(trip.last_location_at)} />
+          <Metric label="家人目前位置" value={familyPosition ? formatCoordinate(familyPosition) : "尚未取得家人位置"} />
           <Metric label="快到提醒距離" value={formatDistance(trip.alert_radius_m)} />
           <Metric label="已抵達判斷距離" value={formatDistance(trip.arrival_radius_m ?? 100)} />
         </div>
@@ -439,16 +447,23 @@ function SharedTripView({
 
       <section className="journey-panel active">
         <div>
-          <p className="eyebrow">粗略位置</p>
-          <h2>{trip.destination_name}</h2>
-          <p className="muted">此頁顯示的是粗略位置，非精準定位。</p>
+          <p className="eyebrow">家人目前位置與目的地</p>
+          <h2>{destinationLabel}</h2>
+          <p className="muted">{familyPosition ? "地圖顯示家人目前位置與目的地。" : "尚未取得家人位置，地圖先顯示目的地。"}</p>
         </div>
         <div className="map-block">
-          <TripMap currentPosition={currentPosition} destination={destination} radiusMeters={trip.alert_radius_m} />
+          <TripMap
+            currentLabel="家人目前位置"
+            currentPosition={familyPosition}
+            destination={destination}
+            destinationLabel="目的地"
+            radiusMeters={trip.alert_radius_m}
+          />
           <div className="map-summary">
-            <Metric label="目前位置最後更新" value={formatDateTime(trip.last_location_at)} />
-            <Metric label="目的地" value={trip.destination_name} />
-            <Metric label="距離目的地" value={formatDistance(trip.distance_m ?? undefined)} />
+            <Metric label="家人目前位置" value={familyPosition ? formatCoordinate(familyPosition) : "尚未取得家人位置"} />
+            <Metric label="目的地" value={destinationLabel} />
+            <Metric label="距離目的地" value={`約 ${formatDistance(trip.distance_m ?? undefined)}`} />
+            <Metric label="最後更新" value={formatDateTime(trip.last_location_at)} />
           </div>
         </div>
       </section>
@@ -542,6 +557,32 @@ function Metric({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function getDestinationLabel(trip: CloudTripRow) {
+  return trip.destination_name?.trim() || trip.destination_address?.trim() || "目的地";
+}
+
+function getFamilyPosition(trip: CloudTripRow): CurrentPosition | undefined {
+  if (typeof trip.current_lat === "number" && typeof trip.current_lng === "number") {
+    return {
+      lat: trip.current_lat,
+      lng: trip.current_lng,
+      updatedAt: trip.last_location_at ?? trip.started_at
+    };
+  }
+  if (typeof trip.approximate_lat === "number" && typeof trip.approximate_lng === "number") {
+    return {
+      lat: trip.approximate_lat,
+      lng: trip.approximate_lng,
+      updatedAt: trip.last_location_at ?? trip.started_at
+    };
+  }
+  return undefined;
+}
+
+function formatCoordinate(position: CurrentPosition) {
+  return `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}`;
 }
 
 function normalizeTripRow(row: CloudTripRow, shareCode: string): CloudTripRow {

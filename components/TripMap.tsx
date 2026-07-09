@@ -7,7 +7,9 @@ import type { CurrentPosition, Destination } from "@/lib/types";
 
 type TripMapProps = {
   destination: Destination;
+  destinationLabel?: string;
   currentPosition?: CurrentPosition;
+  currentLabel?: string;
   radiusMeters: number;
 };
 
@@ -25,7 +27,7 @@ const currentIcon = L.divIcon({
   iconAnchor: [9, 9]
 });
 
-export default function TripMap({ currentPosition, destination, radiusMeters }: TripMapProps) {
+export default function TripMap({ currentLabel = "目前位置", currentPosition, destination, destinationLabel = "目的地", radiusMeters }: TripMapProps) {
   if (typeof destination.lat !== "number" || typeof destination.lng !== "number") {
     return null;
   }
@@ -47,11 +49,11 @@ export default function TripMap({ currentPosition, destination, radiusMeters }: 
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
-      <Marker icon={destinationIcon} position={destinationPoint} />
+      <Marker icon={destinationIcon} position={destinationPoint} title={destinationLabel} />
       <Circle center={destinationPoint} pathOptions={{ color: "#f5f5f5", fillColor: "#f5f5f5", fillOpacity: 0.08 }} radius={radiusMeters} />
       {currentPoint ? (
         <>
-          <Marker icon={currentIcon} position={currentPoint} />
+          <Marker icon={currentIcon} position={currentPoint} title={currentLabel} />
           <Polyline pathOptions={{ color: "#d4d4d8", weight: 3, opacity: 0.76 }} positions={[currentPoint, destinationPoint]} />
         </>
       ) : null}

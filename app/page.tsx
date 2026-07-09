@@ -227,6 +227,17 @@ type NotificationCenterItem = {
   read?: boolean;
 };
 
+type LastEndedTripSummary = {
+  destinationName: string;
+  endedAt: string;
+};
+
+type StopTripOptions = {
+  confirm?: boolean;
+  status?: string;
+  message?: string;
+};
+
 type SidebarSection = "preflight" | "notifications" | "family" | "testMode" | "notificationCenter" | "diagnostics" | null;
 
 const emptyDestinationForm: DestinationFormState = {
@@ -300,6 +311,8 @@ export default function Home() {
   const [notificationCenterMessage, setNotificationCenterMessage] = useState("");
   const [testModeMessage, setTestModeMessage] = useState("");
   const [activeWakeRequest, setActiveWakeRequest] = useState<WakeRequestRow | null>(null);
+  const [lastEndedTrip, setLastEndedTrip] = useState<LastEndedTripSummary | null>(null);
+  const [isStartingTrip, setIsStartingTrip] = useState(false);
   const [wakeToneActive, setWakeToneActive] = useState(false);
   const [eventsExpanded, setEventsExpanded] = useState(false);
   const [preflightOpen, setPreflightOpen] = useState(false);
@@ -1020,13 +1033,20 @@ export default function Home() {
       return;
     }
 
-    const safeArrivalRadius = getSafeArrivalRadius(arrivalRadiusMeters, radiusMeters);
+    if (isStartingTrip) {
+      return;
+    }
+
+    setIsStartingTrip(true);
+    try {
+      const safeArrivalRadius = getSafeArrivalRadius(arrivalRadiusMeters, radiusMeters);
     setStrongAlert("正在準備行程...");
     const recentPreflight = Boolean(preflightTestedAt && Date.now() - new Date(preflightTestedAt).getTime() <= 5 * 60 * 1000);
-    let startPreflightResults: PreflightCheckResult[] | null = null;
+    let startPreflightResults: PreflightCheckResult[] | null = recentPreflight && preflightResults.length > 0 ? preflightResults : null;
     if (recentPreflight) {
       const locationOk = await confirmLocationForStart();
       if (!locationOk) {
+        setStrongAlert("無法取得定位，請開啟定位權限後再出發。");
         return;
       }
     } else {
@@ -1045,6 +1065,9 @@ export default function Home() {
     setPreflightArrivalRadiusMeters(safeArrivalRadius);
     setPreflightOpen(false);
     beginOfficialTrip(selectedDestination, radiusMeters, safeArrivalRadius);
+    } finally {
+      setIsStartingTrip(false);
+    }
   }
 
   function chooseAlertRadius(value: number) {
@@ -1527,6 +1550,10 @@ export default function Home() {
     stopGeolocationWatch();
     releaseWakeLock();
     stopAlertSoundLoop();
+    setLastEndedTrip({
+      destinationName: destination.name,
+      endedAt: new Date().toISOString()
+    });
     setActiveTrip(null);
     setPreflightOpen(false);
     setPreflightDestination(null);
@@ -1535,13 +1562,24 @@ export default function Home() {
     );
   }
 
-  async function stopTrip() {
+  async function stopTrip(options: StopTripOptions = {}) {
+    if (activeTrip && options.confirm !== false) {
+      const shouldEnd = window.confirm("要結束這趟行程嗎？\n結束後家人將不能再呼叫，也不會再看到即時位置。");
+      if (!shouldEnd) {
+        return;
+      }
+    }
     if (activeTrip) {
-      const ended = await endCloudTrip(activeTrip.status);
+      const ended = await endCloudTrip(options.status ?? activeTrip.status);
       if (!ended) {
         setStrongAlert("結束行程同步失敗，請稍後再試。");
         return;
       }
+      const endedAt = new Date().toISOString();
+      setLastEndedTrip({
+        destinationName: activeTrip.destination.name,
+        endedAt
+      });
       stopGeolocationWatch();
       releaseWakeLock();
       stopAlertSoundLoop();
@@ -1549,7 +1587,7 @@ export default function Home() {
       appendEvent("結束行程", `${activeTrip.destination.name} 的行程已結束`);
     }
     setActiveTrip(null);
-    setStrongAlert(null);
+    setStrongAlert("行程已結束");
     setWakeLockStatus("尚未啟用");
     setPreflightOpen(false);
     setPreflightDestination(null);
@@ -2249,7 +2287,7 @@ export default function Home() {
     }
 
     appendEvent("雲端行程同步成功", "雲端共享行程已標記結束");
-    if (share.shareCode) {
+    if (share.shareCode && status !== "已抵達") {
       await notifyFamilyTripEvent(share.shareCode, "trip_ended");
     }
     return true;
@@ -2534,7 +2572,7 @@ export default function Home() {
   }
 
   function resetLocalData() {
-    stopTrip();
+    void stopTrip({ confirm: false });
     clearGeoClockStorage();
     setUser(null);
     setNicknameInput("");
@@ -2554,6 +2592,7 @@ export default function Home() {
     setCustomTripDurationInput("");
     setSelectedTripRecipients([]);
     setExistingCloudTrip(null);
+    setLastEndedTrip(null);
     setPrivacySettings(DEFAULT_PRIVACY_SETTINGS);
     setFamily([]);
     setEvents([]);
@@ -2573,7 +2612,7 @@ export default function Home() {
           <p className="eyebrow">GeoClock Web</p>
           <h1>到站提醒與家人協助叫醒</h1>
           <div className="entry-tabs">
-            <span>我要開始行程</span>
+            <span>我要出發</span>
             <span>我是家人，用代號查看</span>
           </div>
           <p className="muted">本人請先建立本機暱稱；家人完成連線後可用家人代號查看目前行程，分享連結作為備用。</p>
@@ -2664,8 +2703,8 @@ export default function Home() {
         <article className="card v6-action-card">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">開始行程</p>
-              <h2>我要開始行程</h2>
+              <p className="eyebrow">出發</p>
+              <h2>我要出發</h2>
             </div>
             <button className="ghost-button small-button" onClick={() => { setSidebarSection("preflight"); setSidebarOpen(true); }} type="button">
               行前測試
@@ -2674,7 +2713,14 @@ export default function Home() {
 
           {!activeTrip ? (
             <div className="stack">
-              <p className="step-label">Step 1：去哪裡</p>
+              {lastEndedTrip ? (
+                <div className="inline-status">
+                  <strong>目前沒有行程</strong>
+                  <p className="field-hint">上次行程：{lastEndedTrip.destinationName}</p>
+                  <p className="field-hint">結束時間：{formatTime(lastEndedTrip.endedAt)}</p>
+                </div>
+              ) : null}
+              <p className="step-label">第一段：你要去哪裡</p>
               <form className="compact-destination-form" onSubmit={handleDestinationSubmit}>
                 <label>
                   目的地名稱
@@ -2746,7 +2792,42 @@ export default function Home() {
                 )}
               </div>
 
-              <p className="step-label">Step 2：何時提醒</p>
+              {selectedDestination ? (
+                <div className="inline-status">
+                  <strong>已選目的地：{selectedDestination.name}</strong>
+                  <p className="field-hint">{selectedDestination.address || "地址尚未填寫"}</p>
+                  <span className={hasCoordinates(selectedDestination) ? "good" : "warning"}>
+                    {hasCoordinates(selectedDestination) ? "已取得目的地定位" : "定位資料尚未取得"}
+                  </span>
+                </div>
+              ) : null}
+
+              <div className="stack">
+                <p className="step-label">第二段：通知誰</p>
+                <p className="eyebrow">通知家人</p>
+                {confirmedFamilyOptions.length === 0 ? (
+                  <p className="muted">尚未連線家人，仍可自己使用到站提醒。</p>
+                ) : (
+                  <div className="permission-grid">
+                    {confirmedFamilyOptions.map((familyOption) => (
+                      <label className="toggle-row" key={familyOption.code}>
+                        <input
+                          checked={selectedTripRecipients.includes(familyOption.code)}
+                          onChange={(event) => toggleTripRecipient(familyOption.code, event.target.checked)}
+                          type="checkbox"
+                        />
+                        <span>
+                          {familyOption.code}
+                          {!familyPushEnabledCodes.has(familyOption.code) ? "（尚未啟用通知，但仍可在 GeoClock 內查看）" : ""}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <details className="mobile-details">
+                <summary>第三段：進階設定</summary>
               <div className="radius-options">
                 {RADIUS_OPTIONS.map((option) => (
                   <button className={radiusMeters === option.value ? "selected" : ""} key={option.value} onClick={() => chooseAlertRadius(option.value)} type="button">
@@ -2805,29 +2886,7 @@ export default function Home() {
                   </div>
                 </details>
               </div>
-              <div className="stack">
-                <p className="step-label">Step 3：通知誰</p>
-                <p className="eyebrow">通知家人</p>
-                {confirmedFamilyOptions.length === 0 ? (
-                  <p className="muted">尚未連線家人。你仍可開始行程，之後用分享連結提供查看。</p>
-                ) : (
-                  <div className="permission-grid">
-                    {confirmedFamilyOptions.map((familyOption) => (
-                      <label className="toggle-row" key={familyOption.code}>
-                        <input
-                          checked={selectedTripRecipients.includes(familyOption.code)}
-                          onChange={(event) => toggleTripRecipient(familyOption.code, event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>
-                          {familyOption.code}
-                          {!familyPushEnabledCodes.has(familyOption.code) ? "（尚未啟用通知，但仍可在 GeoClock 內查看）" : ""}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-              </div>
+              </details>
               <div className="preflight-summary-row">
                 <span>行前檢查：{preflightBadge}</span>
                 <div className="compact-actions">
@@ -2860,16 +2919,16 @@ export default function Home() {
                 </div>
               ) : null}
               <div className="trip-actions">
-                <button className="primary-button" disabled={!selectedDestination || Boolean(activeTrip)} onClick={startTrip} type="button">
-                  出發
+                <button className="primary-button" disabled={!selectedDestination || Boolean(activeTrip) || isStartingTrip} onClick={startTrip} type="button">
+                  {isStartingTrip ? "正在準備行程..." : "出發"}
                 </button>
                 <button className="secondary-button" onClick={() => { setSidebarSection("notifications"); setSidebarOpen(true); }} type="button">
                   通知設定
                 </button>
               </div>
-              {preflightOpen && preflightDestination ? (
+              {false && preflightOpen && preflightDestination ? (
                 <div className="inline-status">
-                  <strong>啟動前檢查：{preflightDestination.name}</strong>
+                  <strong>啟動前檢查：{preflightDestination?.name}</strong>
                   <p className="field-hint">定位測試成功後才能正式開始旅程。詳細測試在側欄。</p>
                   <button className="primary-button" disabled={!preflightCanStart || Boolean(activeTrip)} onClick={startOfficialTrip} type="button">
                     正式開始旅程
@@ -2881,11 +2940,11 @@ export default function Home() {
             <div className="stack">
               <div className="status-grid">
                 <Metric label="目的地" value={activeTrip.destination.name} />
-                <Metric label="目前距離" value={formatDistance(activeTrip.distanceMeters)} />
-                <Metric label="狀態" value={activeTrip.status} />
-                <Metric label="最後位置更新" value={formatTime(activeTrip.lastPosition?.updatedAt)} />
-                <Metric label="背景通知" value={notificationState.status} />
-                <Metric label="位置更新" value={getPublicLocationStatus(activeTrip.lastPosition?.updatedAt, false)} />
+                <Metric label="距離目的地" value={formatDistance(activeTrip.distanceMeters)} />
+                <Metric label="快到提醒距離" value={formatDistance(activeTrip.radiusMeters)} />
+                <Metric label="已通知家人" value={selectedTripRecipients.length > 0 ? selectedTripRecipients.join("、") : "未通知家人"} />
+                <Metric label="最後更新時間" value={formatTime(activeTrip.lastPosition?.updatedAt)} />
+                <Metric label="行程開始時間" value={formatTime(activeTrip.startedAt)} />
               </div>
               {foregroundLocationMessage ? <p className="form-notice">{foregroundLocationMessage}</p> : null}
               {cloudShare.expiresAt && Date.now() >= new Date(cloudShare.expiresAt).getTime() ? (
@@ -2893,7 +2952,7 @@ export default function Home() {
               ) : null}
               <p className="notice">若一段時間沒有更新，家人會看到位置更新暫停。若需要穩定背景定位，之後需做原生 App。</p>
               <div className="trip-actions">
-                <button className="danger-button" onClick={stopTrip} type="button">
+                <button className="danger-button" onClick={() => void stopTrip()} type="button">
                   結束行程
                 </button>
               </div>
@@ -2983,7 +3042,7 @@ export default function Home() {
         onMarkNotificationCenterRead={markNotificationCenterRead}
         onSimulateArrived={simulateTestArrived}
         onSimulateDistance={simulateTestDistance}
-        onSimulateEndTrip={stopTrip}
+        onSimulateEndTrip={() => void stopTrip({ confirm: false })}
         onSimulateExpired={simulateTestExpired}
         onSimulateStale={simulateTestStale}
         onStartOfficialTrip={startOfficialTrip}
@@ -3317,7 +3376,7 @@ export default function Home() {
           >
             出發
           </button>
-          <button className="secondary-button" disabled={!activeTrip} onClick={stopTrip}>
+          <button className="secondary-button" disabled={!activeTrip} onClick={() => void stopTrip()}>
             結束行程
           </button>
         </div>
@@ -3836,6 +3895,7 @@ function SettingsSidebar({
           </div>
           <p className="notice">背景通知會透過系統通知提醒。畫面開著時，可額外播放提示聲。</p>
           <p className="muted">{getStandaloneHint()}</p>
+          <BackgroundNotificationTypes />
           <div className="trip-actions">
             <button className="primary-button" disabled={notificationState.status === "被拒絕" || notificationState.status === "此瀏覽器不支援"} onClick={onEnableNotifications} type="button">
               啟用本人通知
@@ -4099,6 +4159,36 @@ function DiagnosticList({ items }: { items: NotificationDiagnostic[] }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function BackgroundNotificationTypes() {
+  return (
+    <details className="advanced-settings">
+      <summary>背景通知類型</summary>
+      <div className="notification-type-list">
+        <div>
+          <p className="eyebrow">本人會收到</p>
+          <ul>
+            <li>測試通知：確認你可以收到背景通知。</li>
+            <li>開始通知：你開始前往目的地時提醒，含出發時間。</li>
+            <li>快到達通知：進入快到提醒距離時提醒，含快到達時間。</li>
+            <li>到達目的地通知：抵達後自動結束行程時提醒，含抵達時間。</li>
+            <li>結束行程通知：你手動結束行程時提醒，含結束時間與總用時。</li>
+            <li>被呼叫通知：家人按一次呼叫，你收到一次通知。</li>
+          </ul>
+        </div>
+        <div>
+          <p className="eyebrow">被通知人會收到</p>
+          <ul>
+            <li>開始通知：本趟勾選家人會收到，含出發時間。</li>
+            <li>快抵達通知：本趟勾選家人會收到，含快抵達時間。</li>
+            <li>結束通知：本趟勾選家人會收到，含結束時間與總用時。</li>
+            <li>回應通知：被呼叫的人按「我醒了」後，原呼叫者會收到，含回應時間。</li>
+          </ul>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -4544,7 +4634,7 @@ function showLocalTestNotification() {
     return;
   }
   new Notification("GeoClock 測試通知", {
-    body: "背景通知測試。實際到站通知仍受 iPhone PWA 與系統設定限制。"
+    body: "你可以收到背景通知。"
   });
 }
 
